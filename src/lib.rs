@@ -690,58 +690,63 @@ mod tests {
 
     // Basic tests
     #[tokio::test]
-    async fn test_new_and_get() {
+    async fn test_new_and_get() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(42);
-        assert_eq!(property.get().unwrap(), 42);
+        assert_eq!(property.get()?, 42);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_set() {
+    async fn test_set() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(10);
-        property.set(20).unwrap();
-        assert_eq!(property.get().unwrap(), 20);
+        property.set(20)?;
+        assert_eq!(property.get()?, 20);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_set_async() {
+    async fn test_set_async() -> Result<(), PropertyError> {
         let property = ObservableProperty::new("hello".to_string());
-        property.set_async("world".to_string()).await.unwrap();
-        assert_eq!(property.get().unwrap(), "world");
+        property.set_async("world".to_string()).await?;
+        assert_eq!(property.get()?, "world");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_clone() {
+    async fn test_clone() -> Result<(), PropertyError> {
         let property1 = ObservableProperty::new(100);
         let property2 = property1.clone();
 
         // Change through property2
-        property2.set(200).unwrap();
+        property2.set(200)?;
 
         // Both should reflect the change
-        assert_eq!(property1.get().unwrap(), 200);
-        assert_eq!(property2.get().unwrap(), 200);
+        assert_eq!(property1.get()?, 200);
+        assert_eq!(property2.get()?, 200);
+        Ok(())
     }
 
     // Observer tests
     #[tokio::test]
-    async fn test_subscribe_and_notify() {
+    async fn test_subscribe_and_notify() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
         property.subscribe(Arc::new(move |_, _| {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-        })).unwrap();
+        }))?;
 
-        property.set(1).unwrap();
-        property.set(2).unwrap();
-        property.set(3).unwrap();
+        property.set(1)?;
+        property.set(2)?;
+        property.set(3)?;
 
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_subscribe_async() {
+    async fn test_subscribe_async() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
@@ -753,20 +758,21 @@ mod tests {
                 sleep(Duration::from_millis(10)).await;
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-        }).unwrap();
+        })?;
 
-        property.set_async(1).await.unwrap();
-        property.set_async(2).await.unwrap();
+        property.set_async(1).await?;
+        property.set_async(2).await?;
 
         // Give time for async operations to complete
         sleep(Duration::from_millis(50)).await;
 
         // Check counter after async operations complete
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multiple_observers() {
+    async fn test_multiple_observers() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter1 = Arc::new(AtomicUsize::new(0));
         let counter2 = Arc::new(AtomicUsize::new(0));
@@ -774,48 +780,50 @@ mod tests {
         property.subscribe(Arc::new({
             let counter = counter1.clone();
             move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
-        })).unwrap();
+        }))?;
 
         property.subscribe(Arc::new({
             let counter = counter2.clone();
             move |_, _| { counter.fetch_add(2, Ordering::SeqCst); }
-        })).unwrap();
+        }))?;
 
-        property.set(42).unwrap();
+        property.set(42)?;
 
         assert_eq!(counter1.load(Ordering::SeqCst), 1);
         assert_eq!(counter2.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_unsubscribe() {
+    async fn test_unsubscribe() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
         let id = property.subscribe(Arc::new({
             let counter = counter.clone();
             move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
-        })).unwrap();
+        }))?;
 
-        property.set(1).unwrap();
+        property.set(1)?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Unsubscribe and verify it was removed
-        let was_removed = property.unsubscribe(id).unwrap();
+        let was_removed = property.unsubscribe(id)?;
         assert!(was_removed);
 
         // Set again, counter should not increase
-        property.set(2).unwrap();
+        property.set(2)?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Try to unsubscribe again, should return false
-        let was_removed_again = property.unsubscribe(id).unwrap();
+        let was_removed_again = property.unsubscribe(id)?;
         assert!(!was_removed_again);
+        Ok(())
     }
 
     // Filtered observer tests
     #[tokio::test]
-    async fn test_filtered_observer() {
+    async fn test_filtered_observer() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -825,18 +833,19 @@ mod tests {
                 move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
             }),
             |old, new| new > old // Only trigger when value increases
-        ).unwrap();
+        )?;
 
-        property.set(10).unwrap(); // Should trigger (0 -> 10)
-        property.set(5).unwrap();  // Should NOT trigger (10 -> 5)
-        property.set(15).unwrap(); // Should trigger (5 -> 15)
+        property.set(10)?; // Should trigger (0 -> 10)
+        property.set(5)?;  // Should NOT trigger (10 -> 5)
+        property.set(15)?; // Should trigger (5 -> 15)
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     // Concurrent access tests
     #[tokio::test]
-    async fn test_concurrent_modifications() {
+    async fn test_concurrent_modifications() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let property = Arc::new(ObservableProperty::new(0));
         let final_counter = Arc::new(AtomicUsize::new(0));
 
@@ -846,7 +855,7 @@ mod tests {
             move |_, new| {
                 counter.store(*new, Ordering::SeqCst);
             }
-        })).unwrap();
+        }))?;
 
         // Create multiple tasks to update the property concurrently
         let mut tasks = vec![];
@@ -854,48 +863,50 @@ mod tests {
         for i in 1..=5 {
             let prop = property.clone();
             let task = tokio::spawn(async move {
-                prop.set(i).unwrap();
+                prop.set(i).map_err(|e| format!("Failed to set property: {}", e))
             });
             tasks.push(task);
         }
 
         // Wait for all tasks to complete
         for task in tasks {
-            task.await.unwrap();
+            task.await??;
         }
 
         // Final value should be one of the set values (1-5)
         let final_value = final_counter.load(Ordering::SeqCst);
         assert!(final_value >= 1 && final_value <= 5);
+        Ok(())
     }
 
     // Test for observer panic handling
     #[tokio::test]
-    async fn test_observer_panic_handling() {
+    async fn test_observer_panic_handling() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
         // First observer panics
         property.subscribe(Arc::new(|_, _| {
             panic!("This observer intentionally panics");
-        })).unwrap();
+        }))?;
 
         // Second observer should still run
         property.subscribe(Arc::new({
             let counter = counter.clone();
             move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
-        })).unwrap();
+        }))?;
 
         // This should not panic the test
-        property.set(42).unwrap();
+        property.set(42)?;
 
         // Second observer should have run
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     // Test async observer with set_async
     #[tokio::test]
-    async fn test_async_observers_with_async_set() {
+    async fn test_async_observers_with_async_set() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -903,7 +914,7 @@ mod tests {
         property.subscribe(Arc::new({
             let counter = counter.clone();
             move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
-        })).unwrap();
+        }))?;
 
         let counter_clone = counter.clone();
         property.subscribe_async(move |_, _| {
@@ -912,21 +923,22 @@ mod tests {
                 sleep(Duration::from_millis(10)).await;
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-        }).unwrap();
+        })?;
 
         // Using set_async should notify both observers
-        property.set_async(42).await.unwrap();
+        property.set_async(42).await?;
 
         // Give time for async observer to complete
         sleep(Duration::from_millis(50)).await;
 
         // Both observers should have incremented the counter
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     // Test for stress with many observers
     #[tokio::test]
-    async fn test_many_observers() {
+    async fn test_many_observers() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -937,22 +949,23 @@ mod tests {
                 move |_, _| {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
-            })).unwrap();
+            }))?;
         }
 
         // Trigger all observers
-        property.set_async(999).await.unwrap();
+        property.set_async(999).await?;
 
         // Wait for all to complete
         sleep(Duration::from_millis(100)).await;
 
         // All 100 observers should have incremented the counter
         assert_eq!(counter.load(Ordering::SeqCst), 100);
+        Ok(())
     }
 
     // Test for correct old and new values in observers
     #[tokio::test]
-    async fn test_observer_receives_correct_values() {
+    async fn test_observer_receives_correct_values() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(100);
         let vals = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
 
@@ -962,12 +975,13 @@ mod tests {
                 vals.0.store(*old, Ordering::SeqCst);
                 vals.1.store(*new, Ordering::SeqCst);
             }
-        })).unwrap();
+        }))?;
 
-        property.set(200).unwrap();
+        property.set(200)?;
 
         assert_eq!(vals.0.load(Ordering::SeqCst), 100);
         assert_eq!(vals.1.load(Ordering::SeqCst), 200);
+        Ok(())
     }
 
     // Test for complex data type
@@ -978,7 +992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complex_data_type() {
+    async fn test_complex_data_type() -> Result<(), PropertyError> {
         let person1 = Person {
             name: "Alice".to_string(),
             age: 30,
@@ -990,7 +1004,7 @@ mod tests {
         };
 
         let property = ObservableProperty::new(person1.clone());
-        assert_eq!(property.get().unwrap(), person1);
+        assert_eq!(property.get()?, person1);
 
         let name_changes = Arc::new(AtomicUsize::new(0));
 
@@ -1000,97 +1014,44 @@ mod tests {
                 move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
             }),
             |old, new| old.name != new.name // Only notify on name changes
-        ).unwrap();
+        )?;
 
         // Update age only - shouldn't trigger
         let mut person3 = person1.clone();
         person3.age = 31;
-        property.set(person3).unwrap();
+        property.set(person3)?;
         assert_eq!(name_changes.load(Ordering::SeqCst), 0);
 
         // Update name - should trigger
-        property.set(person2).unwrap();
+        property.set(person2)?;
         assert_eq!(name_changes.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
-    // Test optional wait for observers
+    // Test waiting for observers with proper async handling
     #[tokio::test]
-    async fn test_waiting_for_observers() {
+    async fn test_waiting_for_observers() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // Clone counter before moving it into the closure
+        // Use subscribe_async instead of manually spawning tasks
         let counter_for_observer = counter.clone();
-
-        // Add a regular observer that includes async work directly
-        // instead of using subscribe_async which spawns separate tasks
-        property.subscribe(Arc::new(move |_, _| {
+        property.subscribe_async(move |_, _| {
             let counter = counter_for_observer.clone();
-            // Block on the async work directly in the observer
-            let rt = tokio::runtime::Handle::current();
-            rt.spawn(async move {
+            async move {
                 sleep(Duration::from_millis(50)).await;
                 counter.fetch_add(1, Ordering::SeqCst);
-            });
-        })).unwrap();
-
-        // Use custom implementation of set_async that waits for observers AND their spawned tasks
-        async fn set_async_and_wait<T: Clone + Send + Sync + 'static>(
-            property: &ObservableProperty<T>,
-            new_value: T
-        ) -> Result<(), PropertyError> {
-            let (old_value, observers_snapshot) = {
-                let mut prop = property
-                    .inner
-                    .write()
-                    .map_err(|_| PropertyError::WriteLockError {
-                        context: "setting property value".to_string(),
-                    })?;
-
-                let old_value = prop.value.clone();
-                prop.value = new_value.clone();
-                let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
-                (old_value, observers_snapshot)
-            };
-
-            if observers_snapshot.is_empty() {
-                return Ok(());
             }
+        })?;
 
-            let mut tasks = Vec::with_capacity(observers_snapshot.len());
+        // Use the regular set_async method
+        property.set_async(42).await?;
 
-            for observer in observers_snapshot {
-                let old_val = old_value.clone();
-                let new_val = new_value.clone();
-
-                let task = task::spawn(async move {
-                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        observer(&old_val, &new_val);
-                    })) {
-                        eprintln!("Observer panic in task: {:?}", e);
-                    }
-                });
-
-                tasks.push(task);
-            }
-
-            // Wait for all tasks to complete
-            for task in tasks {
-                task.await.map_err(|e| PropertyError::TokioError {
-                    reason: format!("Task join error: {}", e),
-                })?;
-            }
-
-            Ok(())
-        }
-
-        // Set value and wait for observers
-        set_async_and_wait(&property, 42).await.unwrap();
-
-        // Give additional time for any spawned tasks to complete
+        // Give sufficient time for async observers to complete
         sleep(Duration::from_millis(100)).await;
 
         // Counter should be incremented after the async work completes
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

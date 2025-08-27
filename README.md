@@ -1,23 +1,28 @@
 # Observable Property with Tokio
 
-A thread-safe, async-compatible observable property implementation for Rust that allows you to observe changes to values using Tokio for asynchronous operations.
-This crate is inspired by the observer pattern and is designed to work seamlessly in multi-threaded environments.
-Also, it is a rework of my own obervable-property crate to use Tokio instead of std::thread.
+[![Crates.io](https://img.shields.io/crates/v/observable-property-tokio.svg)](https://crates.io/crates/observable-property-tokio)
+[![Documentation](https://docs.rs/observable-property-tokio/badge.svg)](https://docs.rs/observable-property-tokio)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Disclaimer
+A thread-safe, async-compatible observable property implementation for Rust that allows you to observe changes to values using Tokio for asynchronous operations. This crate is inspired by the observer pattern and is designed to work seamlessly in multi-threaded environments.
 
-This crate is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios. Users should thoroughly test the crate in their specific environment before deploying to production.
+## ⚠️ Important Disclaimer
 
-Performance characteristics may vary depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
+**This crate is provided "as is", without warranty of any kind, express or implied.** The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios.
+
+### Key Considerations:
+
+- **Production Use**: Users should thoroughly test the crate in their specific environment before deploying to production
+- **Performance**: The current implementation spawns individual Tokio tasks for each observer, which may not be optimal for high-frequency updates or large numbers of observers
+- **Memory Usage**: Observer callbacks are stored as `Arc<dyn Fn>` which may have memory overhead considerations
+- **API Stability**: The API may change in future versions as the design evolves
+- **Error Handling**: All operations return `Result` types - proper error handling is essential
+
+**Performance characteristics may vary** depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
 
 By using this crate, you acknowledge that you have read and understood this disclaimer.
 
-## Status
-- **Performance**: The current implementation spawns individual Tokio tasks for each observer, which may not be optimal for high-frequency updates or large numbers of observers.
-- **Memory Usage**: Observer callbacks are stored as `Arc<dyn Fn>` which may have memory overhead considerations.
-- **API Stability**: The API may change in future versions as the design evolves.
-
-## Features
+## 🚀 Features
 
 - **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
 - **Observer pattern**: Subscribe to property changes with callbacks
@@ -25,8 +30,9 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Async notifications**: Non-blocking observer notifications with Tokio tasks
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
+- **Proper error handling**: All operations return `Result` types instead of panicking
 
-## Quick Start
+## 📦 Installation
 
 Add this to your `Cargo.toml`:
 
@@ -35,6 +41,8 @@ Add this to your `Cargo.toml`:
 observable-property-tokio = "0.1.0"
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
+
+## 🔧 Quick Start
 
 ### Basic Usage
 
@@ -65,6 +73,32 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
+### Async Observers
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use tokio::time::{sleep, Duration};
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let property = ObservableProperty::new(0);
+
+    // Subscribe with an async handler
+    property.subscribe_async(|old, new| async move {
+        // Simulate async work
+        sleep(Duration::from_millis(100)).await;
+        println!("Async observer: {} -> {}", old, new);
+    })?;
+
+    property.set_async(42).await?;
+
+    // Give time for async observers to complete
+    sleep(Duration::from_millis(200)).await;
+
+    Ok(())
+}
+```
+
 ### Filtered Observers
 
 ```rust
@@ -76,7 +110,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     let property = ObservableProperty::new(0);
 
     // Only notify when value increases
-    let observer_id = property.subscribe_filtered(
+    property.subscribe_filtered(
         Arc::new(|old, new| println!("Value increased: {} -> {}", old, new)),
         |old, new| new > old
     )?;
@@ -89,34 +123,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
-### Async Observers
-
-```rust
-use observable_property_tokio::ObservableProperty;
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-
-#[tokio::main]
-async fn main() -> Result<(), observable_property_tokio::PropertyError> {
-    let property = ObservableProperty::new(0);
-
-    // This handler can perform async operations
-    property.subscribe_async(|old, new| async move {
-        // Simulate some async work
-        sleep(Duration::from_millis(10)).await;
-        println!("Async observer: {} -> {}", old, new);
-    })?;
-
-    property.set_async(42).await?;
-
-    // Give time for observers to complete
-    sleep(Duration::from_millis(20)).await;
-
-    Ok(())
-}
-```
-
-### Multi-threading Example
+### Multi-threading
 
 ```rust
 use observable_property_tokio::ObservableProperty;
@@ -124,7 +131,7 @@ use std::sync::Arc;
 use tokio::task;
 
 #[tokio::main]
-async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let property = Arc::new(ObservableProperty::new(0));
     let property_clone = property.clone();
 
@@ -134,112 +141,81 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     }))?;
 
     // Modify from another task
-    task::spawn(async move {
-        if let Err(e) = property_clone.set(42) {
-            eprintln!("Failed to set value: {}", e);
-        }
-    }).await.expect("Task panicked");
+    let handle = task::spawn(async move {
+        property_clone.set(42).map_err(|e| format!("Failed to set: {}", e))
+    });
 
+    handle.await??;
     Ok(())
 }
 ```
 
-## Examples
+## 📚 Examples
 
-Run the included examples to see the library in action:
+The crate includes several examples demonstrating different usage patterns:
+
+- [`basic_usage.rs`](examples/basic_usage.rs) - Simple property observation
+- [`filtered_observers.rs`](examples/filtered_observers.rs) - Conditional observers
+- [`async_observers.rs`](examples/async_observers.rs) - Asynchronous observer handlers
+- [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
+
+Run examples with:
 
 ```bash
-# Basic usage
 cargo run --example basic_usage
-
-# Filtered observers
 cargo run --example filtered_observers
-
-# Async observers
 cargo run --example async_observers
-
-# Multi-threading demonstration
 cargo run --example multi_threading
 ```
 
-## API Documentation
+## 🛠️ API Reference
 
-### Core Methods
+### Core Types
 
-- `new(initial_value: T) -> Self` - Create a new observable property
-- `get() -> Result<T, PropertyError>` - Get the current value
-- `set(new_value: T) -> Result<(), PropertyError>` - Set value and notify observers synchronously
-- `set_async(new_value: T) -> Result<(), PropertyError>` - Set value and notify observers asynchronously
+- `ObservableProperty<T>` - The main observable property type
+- `PropertyError` - Error type returned by all operations
+- `Observer<T>` - Type alias for observer functions: `Arc<dyn Fn(&T, &T) + Send + Sync>`
+- `ObserverId` - Unique identifier for observers
 
-### Observer Management
+### Key Methods
 
-- `subscribe(observer: Observer<T>) -> Result<ObserverId, PropertyError>` - Subscribe to changes
-- `subscribe_filtered(observer: Observer<T>, filter: F) -> Result<ObserverId, PropertyError>` - Subscribe with filter
-- `subscribe_async(handler: F) -> Result<ObserverId, PropertyError>` - Subscribe with async handler
-- `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove an observer
+- `new(initial_value: T)` - Create a new observable property
+- `get() -> Result<T, PropertyError>` - Get current value
+- `set(new_value: T) -> Result<(), PropertyError>` - Set value synchronously
+- `set_async(new_value: T) -> Result<(), PropertyError>` - Set value asynchronously
+- `subscribe(observer: Observer<T>) -> Result<ObserverId, PropertyError>` - Add observer
+- `subscribe_async<F, Fut>(handler: F) -> Result<ObserverId, PropertyError>` - Add async observer
+- `subscribe_filtered<F>(observer: Observer<T>, filter: F) -> Result<ObserverId, PropertyError>` - Add filtered observer
+- `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
 
-### Error Handling
+## ⚡ Performance Considerations
 
-The library provides comprehensive error handling through the `PropertyError` enum:
+- **Observer Count**: Each observer is called in a separate Tokio task for `set_async()`, which provides good isolation but may have overhead for many observers
+- **Update Frequency**: High-frequency updates may benefit from batching or debouncing at the application level
+- **Memory Usage**: Observers are stored as `Arc<dyn Fn>` which has some memory overhead
+- **Lock Contention**: Uses `RwLock` which allows multiple readers but exclusive writers
 
-- `ReadLockError` - Failed to acquire read lock
-- `WriteLockError` - Failed to acquire write lock
-- `ObserverNotFound` - Observer ID not found during unsubscribe
-- `PoisonedLock` - Lock poisoned due to panic in another thread
-- `ObserverError` - Observer function encountered an error
-- `TokioError` - Tokio runtime error
+## 🤝 Contributing
 
-## Type Requirements
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
 
-The generic type `T` must implement:
-- `Clone`: Required for returning values and passing them to observers
-- `Send`: Required for transferring between threads
-- `Sync`: Required for concurrent access from multiple threads
-- `'static`: Required for observer callbacks that may outlive the original scope
+## 📄 License
 
-## Performance Considerations
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-- **Observer Execution**: Synchronous observers block the setter, while async observers are spawned as separate tasks
-- **Lock Contention**: Multiple concurrent reads are allowed, but writes are exclusive
-- **Memory**: Each observer is stored as an `Arc<dyn Fn>` with associated overhead
-- **Task Spawning**: Async operations create new Tokio tasks which have startup costs
+## 🔗 Related Projects
 
-## Testing
+This crate is a rework of the original `observable-property` crate to use Tokio instead of `std::thread` for better async compatibility.
 
-Run the test suite with:
+## 📞 Support
 
-```bash
-cargo test
-```
+If you encounter any issues or have questions:
 
-The project includes comprehensive tests covering:
-- Basic property operations
-- Observer notifications
-- Concurrent access
-- Error handling
-- Panic recovery
-- Async operations
+1. Check the [documentation](https://docs.rs/observable-property-tokio)
+2. Look at the [examples](examples/)
+3. Search existing [issues](https://github.com/snoekiede/ObservablePropertiesTokio/issues)
+4. Create a new issue if needed
 
-## License
+---
 
-Licensed under either of
-
-* Apache License, Version 2.0, ([LICENSE-APACHE](https://www.google.com/search?q=LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-
-* MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-## Contributing
-
-This is an experimental project. Contributions, suggestions, and feedback are welcome through issues and pull requests.
-
-## Changelog
-
-### v0.1.0
-- Initial implementation
-- Basic observable property functionality
-- Synchronous and asynchronous observers
-- Filtered observers
-- Comprehensive error handling
-- Thread-safe operations with Tokio integration
+**Remember**: This software comes with no warranty. Test thoroughly before production use.
