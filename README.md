@@ -4,10 +4,15 @@ A thread-safe, async-compatible observable property implementation for Rust that
 This crate is inspired by the observer pattern and is designed to work seamlessly in multi-threaded environments.
 Also, it is a rework of my own obervable-property crate to use Tokio instead of std::thread.
 
-## ⚠️ Disclaimer
+## Disclaimer
 
-**This project is experimental and intended for educational purposes.** While the implementation includes comprehensive testing and error handling, it has not been extensively tested in production environments. Use at your own risk in production systems.
+This crate is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios. Users should thoroughly test the crate in their specific environment before deploying to production.
 
+Performance characteristics may vary depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
+
+By using this crate, you acknowledge that you have read and understood this disclaimer.
+
+## Status
 - **Performance**: The current implementation spawns individual Tokio tasks for each observer, which may not be optimal for high-frequency updates or large numbers of observers.
 - **Memory Usage**: Observer callbacks are stored as `Arc<dyn Fn>` which may have memory overhead considerations.
 - **API Stability**: The API may change in future versions as the design evolves.
