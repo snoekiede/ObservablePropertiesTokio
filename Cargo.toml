@@ -1,0 +1,35 @@
+[package]
+name = "observable-property-tokio"
+version = "0.1.0"
+edition = "2024"
+authors = ["Iede Snoek <info@esoxsolutions.nl>"]
+description = "A thread-safe, async-compatible observable property implementation for Rust using Tokio"
+readme = "README.md"
+homepage = "https://github.com/snoekiede/ObservablePropertiesTokio"
+repository = "https://github.com/snoekiede/ObservablePropertiesTokio"
+license = "MIT"
+keywords = ["observable", "property", "tokio", "async", "observer-pattern"]
+categories = ["asynchronous", "concurrency", "data-structures"]
+rust-version = "1.89"
+
+[dependencies]
+tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "filtered_observers"
+path = "examples/filtered_observers.rs"
+
+[[example]]
+name = "async_observers"
+path = "examples/async_observers.rs"
+
+[[example]]
+name = "multi_threading"
+path = "examples/multi_threading.rs"
