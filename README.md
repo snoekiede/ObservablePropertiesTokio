@@ -198,9 +198,15 @@ cargo run --example multi_threading
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Licensed under either of
+
+* Apache License, Version 2.0, ([LICENSE-APACHE](https://www.google.com/search?q=LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+
+* MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
 
 ## 🔗 Related Projects
 
