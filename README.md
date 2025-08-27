@@ -217,7 +217,13 @@ The project includes comprehensive tests covering:
 
 ## License
 
-This project is available under the MIT License. See LICENSE file for details.
+Licensed under either of
+
+* Apache License, Version 2.0, ([LICENSE-APACHE](https://www.google.com/search?q=LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+
+* MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
 
 ## Contributing
 
