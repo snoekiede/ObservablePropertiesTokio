@@ -14,7 +14,8 @@ rust-version = "1.89"
 
 [dependencies]
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "time"] }
-
+thiserror = "1.0"
+parking_lot = "0.12"
 
 
 [[example]]
