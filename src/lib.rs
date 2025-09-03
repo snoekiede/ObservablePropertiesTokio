@@ -5,7 +5,7 @@
 //!
 //! ## Features
 //!
-//! - **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
+//! - **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access with optimized locking
 //! - **Observer pattern**: Subscribe to property changes with callbacks
 //! - **Filtered observers**: Only notify when specific conditions are met
 //! - **Async notifications**: Non-blocking observer notifications with Tokio tasks
@@ -26,28 +26,16 @@
 //!     // Subscribe to changes
 //!     let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
 //!         println!("Value changed from {} to {}", old_value, new_value);
-//!     })).map_err(|e| {
-//!         eprintln!("Failed to subscribe: {}", e);
-//!         e
-//!     })?;
+//!     }))?;
 //!
 //!     // Change the value (triggers observer)
-//!     property.set(100).map_err(|e| {
-//!         eprintln!("Failed to set value: {}", e);
-//!         e
-//!     })?;
+//!     property.set(100)?;
 //!
 //!     // For async notification (uses Tokio)
-//!     property.set_async(200).await.map_err(|e| {
-//!         eprintln!("Failed to set value asynchronously: {}", e);
-//!         e
-//!     })?;
+//!     property.set_async(200).await?;
 //!
 //!     // Unsubscribe when done
-//!     property.unsubscribe(observer_id).map_err(|e| {
-//!         eprintln!("Failed to unsubscribe: {}", e);
-//!         e
-//!     })?;
+//!     property.unsubscribe(observer_id)?;
 //!
 //!     Ok(())
 //! }
@@ -68,17 +56,13 @@
 //!     // Subscribe from one task
 //!     property.subscribe(Arc::new(|old, new| {
 //!         println!("Value changed: {} -> {}", old, new);
-//!     })).map_err(|e| {
-//!         eprintln!("Failed to subscribe: {}", e);
-//!         e
-//!     })?;
+//!     }))?;
 //!
 //!     // Modify from another task
 //!     task::spawn(async move {
-//!         if let Err(e) = property_clone.set(42) {
-//!             eprintln!("Failed to set value: {}", e);
-//!         }
-//!     }).await.expect("Task panicked");
+//!         property_clone.set(42)?;
+//!         Ok::<_, observable_property_tokio::PropertyError>(())
+//!     }).await??;
 //!
 //!     Ok(())
 //! }
@@ -87,76 +71,108 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::panic;
-use std::sync::{Arc, RwLock};
-use tokio::task;
+use std::sync::Arc;
+use parking_lot::RwLock;
+use thiserror::Error;
+use tokio::task::{self, JoinError};
 
 /// Errors that can occur when working with ObservableProperty
-#[derive(Debug, Clone)]
+#[derive(Error, Debug, Clone)]
 pub enum PropertyError {
     /// Failed to acquire a read lock on the property
+    #[error("Failed to acquire read lock: {context}")]
     ReadLockError {
         /// Context describing what operation was being attempted
         context: String
     },
-    /// Failed to acquire a write lock on the property  
+
+    /// Failed to acquire a write lock on the property
+    #[error("Failed to acquire write lock: {context}")]
     WriteLockError {
         /// Context describing what operation was being attempted
         context: String
     },
+
     /// Attempted to unsubscribe an observer that doesn't exist
+    #[error("Observer with ID {id} not found")]
     ObserverNotFound {
         /// The ID of the observer that wasn't found
-        id: usize
+        id: ObserverId
     },
+
     /// The property's lock has been poisoned due to a panic in another thread
+    #[error("Property is in a poisoned state due to a panic in another thread")]
     PoisonedLock,
+
     /// An observer function encountered an error during execution
+    #[error("Observer execution failed: {reason}")]
     ObserverError {
         /// Description of what went wrong
         reason: String
     },
+
     /// A Tokio-related error occurred
+    #[error("Tokio runtime error: {reason}")]
     TokioError {
         /// Description of what went wrong
         reason: String
     },
-}
 
-impl fmt::Display for PropertyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PropertyError::ReadLockError { context } => {
-                write!(f, "Failed to acquire read lock: {}", context)
-            }
-            PropertyError::WriteLockError { context } => {
-                write!(f, "Failed to acquire write lock: {}", context)
-            }
-            PropertyError::ObserverNotFound { id } => {
-                write!(f, "Observer with ID {} not found", id)
-            }
-            PropertyError::PoisonedLock => {
-                write!(
-                    f,
-                    "Property is in a poisoned state due to a panic in another thread"
-                )
-            }
-            PropertyError::ObserverError { reason } => {
-                write!(f, "Observer execution failed: {}", reason)
-            }
-            PropertyError::TokioError { reason } => {
-                write!(f, "Tokio runtime error: {}", reason)
-            }
-        }
-    }
+    /// A task join error occurred
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
-
-impl std::error::Error for PropertyError {}
 
 /// Function type for observers that get called when property values change
 pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
 
 /// Unique identifier for registered observers
-pub type ObserverId = usize;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObserverId(pub(crate) usize);
+
+impl From<ObserverId> for usize {
+    /// Convert an ObserverId to a usize
+    ///
+    /// This allows backward compatibility with code that expects to use
+    /// the ID as a regular number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::ObserverId;
+    ///
+    /// let id = ObserverId::from(42); // For illustration - actual IDs come from subscribe()
+    /// let value: usize = id.into();
+    /// assert_eq!(value, 42);
+    /// ```
+    fn from(id: ObserverId) -> Self {
+        id.0
+    }
+}
+
+impl From<usize> for ObserverId {
+    /// Create an ObserverId from a usize
+    ///
+    /// This is primarily for backward compatibility and testing.
+    /// In normal usage, IDs are created by the library through subscribe() calls.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::ObserverId;
+    ///
+    /// let id = ObserverId::from(42);
+    /// ```
+    fn from(value: usize) -> Self {
+        ObserverId(value)
+    }
+}
+
+impl fmt::Display for ObserverId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// A thread-safe observable property that notifies observers when its value changes
 ///
@@ -203,7 +219,7 @@ pub struct ObservableProperty<T> {
 struct InnerProperty<T> {
     value: T,
     observers: HashMap<ObserverId, Observer<T>>,
-    next_id: ObserverId,
+    next_id: usize,
 }
 
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
@@ -219,10 +235,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property_tokio::ObservableProperty;
     ///
     /// let property = ObservableProperty::new(42);
-    /// match property.get() {
-    ///     Ok(value) => assert_eq!(value, 42),
-    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
-    /// }
+    /// assert_eq!(property.get().unwrap(), 42);
     /// ```
     pub fn new(initial_value: T) -> Self {
         Self {
@@ -236,13 +249,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
     /// Gets the current value of the property
     ///
-    /// This method acquires a read lock, which allows multiple concurrent readers
-    /// but will block if a writer currently holds the lock.
+    /// This method acquires a read lock, which allows multiple concurrent readers.
     ///
     /// # Returns
     ///
-    /// `Ok(T)` containing a clone of the current value, or `Err(PropertyError)`
-    /// if the lock is poisoned.
+    /// `Ok(T)` containing a clone of the current value
     ///
     /// # Examples
     ///
@@ -250,16 +261,33 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property_tokio::ObservableProperty;
     ///
     /// let property = ObservableProperty::new("hello".to_string());
-    /// match property.get() {
-    ///     Ok(value) => assert_eq!(value, "hello"),
-    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
-    /// }
+    /// assert_eq!(property.get().unwrap(), "hello");
     /// ```
     pub fn get(&self) -> Result<T, PropertyError> {
-        self.inner
-            .read()
-            .map(|prop| prop.value.clone())
-            .map_err(|_| PropertyError::PoisonedLock)
+        Ok(self.inner.read().value.clone())
+    }
+
+    /// Gets a reference to the current value of the property
+    ///
+    /// This method acquires a read lock and returns a guard that derefs to the value,
+    /// allowing you to read the value without cloning it.
+    ///
+    /// # Returns
+    ///
+    /// A RAII guard that derefs to a reference of the value
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new("hello".to_string());
+    /// let value_ref = property.get_ref();
+    /// assert_eq!(*value_ref, "hello");
+    /// // Lock is released when value_ref goes out of scope
+    /// ```
+    pub fn get_ref(&self) -> impl std::ops::Deref<Target = T> + '_ {
+        parking_lot::RwLockReadGuard::map(self.inner.read(), |inner| &inner.value)
     }
 
     /// Sets the property to a new value and notifies all observers
@@ -279,7 +307,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if successful, or `Err(PropertyError)` if the lock is poisoned.
+    /// `Ok(())` if successful
     ///
     /// # Examples
     ///
@@ -302,16 +330,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
-            let mut prop = self
-                .inner
-                .write()
-                .map_err(|_| PropertyError::WriteLockError {
-                    context: "setting property value".to_string(),
-                })?;
+            let mut inner = self.inner.write();
 
-            let old_value = prop.value.clone();
-            prop.value = new_value.clone();
-            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
+            let old_value = inner.value.clone();
+            inner.value = new_value.clone();
+            let observers_snapshot: Vec<Observer<T>> = inner.observers.values().cloned().collect();
             (old_value, observers_snapshot)
         };
 
@@ -332,19 +355,13 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// for non-blocking operation. This is useful when observers might perform
     /// time-consuming operations.
     ///
-    /// Unlike the original implementation that used batching with std::thread,
-    /// this version spawns a separate Tokio task for each observer, taking advantage of
-    /// Tokio's efficient task scheduling system designed for many concurrent tasks.
-    ///
     /// # Arguments
     ///
     /// * `new_value` - The new value to set
     ///
     /// # Returns
     ///
-    /// `Ok(())` if successful, or `Err(PropertyError)` if the lock is poisoned.
-    /// Note that this only indicates the property was updated successfully;
-    /// observer execution happens asynchronously.
+    /// `Ok(())` if successful
     ///
     /// # Examples
     ///
@@ -373,16 +390,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub async fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
-            let mut prop = self
-                .inner
-                .write()
-                .map_err(|_| PropertyError::WriteLockError {
-                    context: "setting property value".to_string(),
-                })?;
+            let mut inner = self.inner.write();
 
-            let old_value = prop.value.clone();
-            prop.value = new_value.clone();
-            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
+            let old_value = inner.value.clone();
+            inner.value = new_value.clone();
+            let observers_snapshot: Vec<Observer<T>> = inner.observers.values().cloned().collect();
             (old_value, observers_snapshot)
         };
 
@@ -391,7 +403,6 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
 
         // Spawn a separate Tokio task for each observer
-        // Tokio is designed to efficiently handle many small tasks
         let mut tasks = Vec::with_capacity(observers_snapshot.len());
 
         for observer in observers_snapshot {
@@ -420,6 +431,78 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         Ok(())
     }
 
+    /// Update the property value using a closure that has access to the current value
+    ///
+    /// This is a more ergonomic way to update a property based on its current value,
+    /// without having to call `get()` and `set()` separately.
+    ///
+    /// # Arguments
+    ///
+    /// * `update_fn` - A function that takes the current value and returns a new value
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(10);
+    ///
+    /// // Double the value
+    /// property.update(|current| current * 2)?;
+    /// assert_eq!(property.get()?, 20);
+    ///
+    /// // Add 5
+    /// property.update(|current| current + 5)?;
+    /// assert_eq!(property.get()?, 25);
+    /// # Ok::<(), observable_property_tokio::PropertyError>(())
+    /// ```
+    pub fn update<F>(&self, update_fn: F) -> Result<(), PropertyError>
+    where
+        F: FnOnce(T) -> T,
+    {
+        let new_value = update_fn(self.get()?);
+        self.set(new_value)
+    }
+
+    /// Update the property value asynchronously using a closure
+    ///
+    /// Like `update()` but uses `set_async()` for the update.
+    ///
+    /// # Arguments
+    ///
+    /// * `update_fn` - A function that takes the current value and returns a new value
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new("hello".to_string());
+    ///
+    ///     property.update_async(|current| format!("{} world", current)).await?;
+    ///     assert_eq!(property.get()?, "hello world");
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn update_async<F>(&self, update_fn: F) -> Result<(), PropertyError>
+    where
+        F: FnOnce(T) -> T,
+    {
+        let new_value = update_fn(self.get()?);
+        self.set_async(new_value).await
+    }
+
     /// Subscribes an observer function to be called when the property changes
     ///
     /// The observer function will be called with the old and new values whenever
@@ -431,8 +514,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(ObserverId)` containing a unique identifier for this observer,
-    /// or `Err(PropertyError)` if the lock is poisoned.
+    /// `Ok(ObserverId)` containing a unique identifier for this observer
     ///
     /// # Examples
     ///
@@ -455,16 +537,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub fn subscribe(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
-        let mut prop = self
-            .inner
-            .write()
-            .map_err(|_| PropertyError::WriteLockError {
-                context: "subscribing observer".to_string(),
-            })?;
+        let mut inner = self.inner.write();
 
-        let id = prop.next_id;
-        prop.next_id += 1;
-        prop.observers.insert(id, observer);
+        let id = ObserverId(inner.next_id);
+        inner.next_id += 1;
+        inner.observers.insert(id, observer);
         Ok(id)
     }
 
@@ -476,9 +553,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(bool)` where `true` means the observer was found and removed,
-    /// `false` means no observer with that ID existed.
-    /// Returns `Err(PropertyError)` if the lock is poisoned.
+    /// `Ok(())` if the observer was removed, or `Err(PropertyError::ObserverNotFound)`
+    /// if no observer with that ID existed.
     ///
     /// # Examples
     ///
@@ -491,25 +567,99 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///     let property = ObservableProperty::new(0);
     ///     let id = property.subscribe(Arc::new(|_, _| {}))?;
     ///
-    ///     let was_removed = property.unsubscribe(id)?;
-    ///     assert!(was_removed); // Observer existed and was removed
+    ///     // Remove the observer
+    ///     property.unsubscribe(id)?;
     ///
-    ///     let was_removed_again = property.unsubscribe(id)?;
-    ///     assert!(!was_removed_again); // Observer no longer exists
+    ///     // Trying to remove again fails with ObserverNotFound
+    ///     match property.unsubscribe(id) {
+    ///         Err(observable_property_tokio::PropertyError::ObserverNotFound { .. }) => {
+    ///             println!("Observer was already removed, as expected");
+    ///         }
+    ///         _ => panic!("Expected ObserverNotFound error"),
+    ///     }
     ///
     ///     Ok(())
     /// }
     /// ```
-    pub fn unsubscribe(&self, id: ObserverId) -> Result<bool, PropertyError> {
-        let mut prop = self
-            .inner
-            .write()
-            .map_err(|_| PropertyError::WriteLockError {
-                context: "unsubscribing observer".to_string(),
-            })?;
+    pub fn unsubscribe(&self, id: ObserverId) -> Result<(), PropertyError> {
+        let mut inner = self.inner.write();
 
-        let was_present = prop.observers.remove(&id).is_some();
-        Ok(was_present)
+        if inner.observers.remove(&id).is_some() {
+            Ok(())
+        } else {
+            Err(PropertyError::ObserverNotFound { id })
+        }
+    }
+
+    /// Removes an observer by its ID, ignoring if it doesn't exist
+    ///
+    /// This is a convenience method that doesn't return an error if the observer doesn't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The observer ID returned by `subscribe()`
+    ///
+    /// # Returns
+    ///
+    /// `true` if an observer was removed, `false` if no observer with that ID existed
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new(0);
+    ///     let id = property.subscribe(Arc::new(|_, _| {}))?;
+    ///
+    ///     // Remove the observer
+    ///     assert!(property.try_unsubscribe(id));
+    ///
+    ///     // Trying to remove again just returns false
+    ///     assert!(!property.try_unsubscribe(id));
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn try_unsubscribe(&self, id: ObserverId) -> bool {
+        let mut inner = self.inner.write();
+        inner.observers.remove(&id).is_some()
+    }
+
+    /// Returns the number of active observers for this property
+    ///
+    /// # Returns
+    ///
+    /// The number of observers currently subscribed to this property
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new(0);
+    ///
+    ///     assert_eq!(property.observer_count(), 0);
+    ///
+    ///     let id1 = property.subscribe(Arc::new(|_, _| {}))?;
+    ///     let id2 = property.subscribe(Arc::new(|_, _| {}))?;
+    ///
+    ///     assert_eq!(property.observer_count(), 2);
+    ///
+    ///     property.unsubscribe(id1)?;
+    ///
+    ///     assert_eq!(property.observer_count(), 1);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn observer_count(&self) -> usize {
+        self.inner.read().observers.len()
     }
 
     /// Subscribes an observer that only gets called when a filter condition is met
@@ -524,7 +674,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(ObserverId)` for the filtered observer, or `Err(PropertyError)` if the lock is poisoned.
+    /// `Ok(ObserverId)` for the filtered observer
     ///
     /// # Examples
     ///
@@ -578,8 +728,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(ObserverId)` containing a unique identifier for this observer,
-    /// or `Err(PropertyError)` if the lock is poisoned.
+    /// `Ok(ObserverId)` containing a unique identifier for this observer
     ///
     /// # Examples
     ///
@@ -628,6 +777,148 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         self.subscribe(observer)
     }
+
+    /// Subscribe with an async handler that is filtered
+    ///
+    /// Combines `subscribe_filtered` and `subscribe_async` to provide an async handler
+    /// that only runs when the filter condition is met.
+    ///
+    /// # Arguments
+    ///
+    /// * `handler` - An async function or closure that takes old and new values
+    /// * `filter` - A predicate function that decides if the handler should be called
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ObserverId)` containing a unique identifier for this observer
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use tokio::time::{sleep, Duration};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new(0);
+    ///
+    ///     // This async handler only runs when value increases
+    ///     property.subscribe_async_filtered(
+    ///         |old, new| async move {
+    ///             sleep(Duration::from_millis(10)).await;
+    ///             println!("Value increased: {} -> {}", old, new);
+    ///         },
+    ///         |old, new| new > old
+    ///     )?;
+    ///
+    ///     property.set(10)?; // Triggers observer (0 -> 10)
+    ///     property.set(5)?;  // Does NOT trigger observer (10 -> 5)
+    ///
+    ///     // Give time for observers to complete
+    ///     sleep(Duration::from_millis(20)).await;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn subscribe_async_filtered<F, Fut, Filt>(
+        &self,
+        handler: F,
+        filter: Filt,
+    ) -> Result<ObserverId, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Filt: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let filter = Arc::new(filter);
+        let handler = Arc::new(handler);
+
+        let observer = Arc::new(move |old: &T, new: &T| {
+            if filter(old, new) {
+                let old_val = old.clone();
+                let new_val = new.clone();
+                let handler_clone = Arc::clone(&handler);
+
+                tokio::spawn(async move {
+                    handler_clone(old_val, new_val).await;
+                });
+            }
+        });
+
+        self.subscribe(observer)
+    }
+
+    /// Create a new ObservableProperty with transformation applied to the value
+    ///
+    /// This creates a derived property that tracks changes to the original property,
+    /// but with a transformation applied. Changes to the original property are reflected
+    /// in the derived property, but the derived property is read-only.
+    ///
+    /// # Arguments
+    ///
+    /// * `transform` - A function that converts from the source type to the target type
+    ///
+    /// # Returns
+    ///
+    /// A new `ObservableProperty<U>` that reflects the transformed value
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let original = ObservableProperty::new(42);
+    ///
+    ///     // Create a derived property that doubles the value
+    ///     let doubled = original.map(|value| value * 2);
+    ///
+    ///     assert_eq!(doubled.get()?, 84);
+    ///
+    ///     // When original changes, doubled reflects the transformation
+    ///     original.set(10)?;
+    ///     assert_eq!(doubled.get()?, 20);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn map<U, F>(&self, transform: F) -> ObservableProperty<U>
+    where
+        U: Clone + Send + Sync + 'static,
+        F: Fn(&T) -> U + Send + Sync + 'static,
+    {
+        let transform = Arc::new(transform);
+        let initial_value = transform(&self.get().expect("Failed to get initial value"));
+        let derived = ObservableProperty::new(initial_value);
+
+        let derived_clone = derived.clone();
+        self.subscribe(Arc::new(move |_, new_value| {
+            let transformed = transform(new_value);
+            if let Err(e) = derived_clone.set(transformed) {
+                eprintln!("Failed to update derived property: {}", e);
+            }
+        })).expect("Failed to subscribe to source property");
+
+        derived
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static + Default> Default for ObservableProperty<T> {
+    /// Creates a new ObservableProperty with the default value for type T
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    ///
+    /// let property: ObservableProperty<i32> = Default::default();
+    /// assert_eq!(property.get().unwrap(), 0); // Default for i32 is 0
+    /// ```
+    fn default() -> Self {
+        Self::new(T::default())
+    }
 }
 
 impl<T: Clone> Clone for ObservableProperty<T> {
@@ -671,11 +962,11 @@ impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for Obs
         match self.get() {
             Ok(value) => f.debug_struct("ObservableProperty")
                 .field("value", &value)
-                .field("observers_count", &"[hidden]")
+                .field("observers_count", &self.observer_count())
                 .finish(),
             Err(_) => f.debug_struct("ObservableProperty")
                 .field("value", &"[inaccessible]")
-                .field("observers_count", &"[hidden]")
+                .field("observers_count", &self.observer_count())
                 .finish(),
         }
     }
@@ -697,10 +988,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_default() {
+        let property: ObservableProperty<String> = Default::default();
+        assert_eq!(property.get().unwrap(), String::default());
+    }
+
+    #[tokio::test]
+    async fn test_get_ref() {
+        let property = ObservableProperty::new("hello".to_string());
+        let value_ref = property.get_ref();
+        assert_eq!(*value_ref, "hello");
+    }
+
+    #[tokio::test]
     async fn test_set() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(10);
         property.set(20)?;
         assert_eq!(property.get()?, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(10);
+        property.update(|val| val * 2)?;
+        assert_eq!(property.get()?, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_async() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(10);
+        property.update_async(|val| val * 2).await?;
+        assert_eq!(property.get()?, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_map() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(10);
+        let derived = property.map(|val| val.to_string());
+
+        assert_eq!(derived.get()?, "10");
+
+        property.set(20)?;
+        assert_eq!(derived.get()?, "20");
         Ok(())
     }
 
@@ -746,6 +1078,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_observer_count() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        assert_eq!(property.observer_count(), 0);
+
+        let id1 = property.subscribe(Arc::new(|_, _| {}))?;
+        let id2 = property.subscribe(Arc::new(|_, _| {}))?;
+        assert_eq!(property.observer_count(), 2);
+
+        property.unsubscribe(id1)?;
+        assert_eq!(property.observer_count(), 1);
+
+        property.unsubscribe(id2)?;
+        assert_eq!(property.observer_count(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_try_unsubscribe() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let id = property.subscribe(Arc::new(|_, _| {}))?;
+
+        assert!(property.try_unsubscribe(id));
+        assert!(!property.try_unsubscribe(id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_subscribe_async() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
@@ -767,6 +1128,35 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
 
         // Check counter after async operations complete
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_async_filtered() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        property.subscribe_async_filtered(
+            move |_, _| {
+                let counter = counter_clone.clone();
+                async move {
+                    sleep(Duration::from_millis(10)).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            |old, new| new > old
+        )?;
+
+        property.set_async(10).await?; // Should trigger (0 -> 10)
+        property.set_async(5).await?;  // Should NOT trigger (10 -> 5)
+        property.set_async(15).await?; // Should trigger (5 -> 15)
+
+        // Give time for async operations to complete
+        sleep(Duration::from_millis(50)).await;
+
+        // Only two updates should have triggered the observer
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         Ok(())
     }
@@ -807,17 +1197,19 @@ mod tests {
         property.set(1)?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Unsubscribe and verify it was removed
-        let was_removed = property.unsubscribe(id)?;
-        assert!(was_removed);
+        // Unsubscribe and verify it no longer receives updates
+        property.unsubscribe(id)?;
 
         // Set again, counter should not increase
         property.set(2)?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Try to unsubscribe again, should return false
-        let was_removed_again = property.unsubscribe(id)?;
-        assert!(!was_removed_again);
+        // Try to unsubscribe again, should fail with ObserverNotFound
+        match property.unsubscribe(id) {
+            Err(PropertyError::ObserverNotFound { .. }) => {},
+            other => panic!("Expected ObserverNotFound error, got {:?}", other),
+        }
+
         Ok(())
     }
 
@@ -904,7 +1296,7 @@ mod tests {
         Ok(())
     }
 
-    // Test async observer with set_async
+    // More tests for new functionality
     #[tokio::test]
     async fn test_async_observers_with_async_set() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
@@ -1053,5 +1445,37 @@ mod tests {
         // Counter should be incremented after the async work completes
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         Ok(())
+    }
+}
+
+impl From<JoinError> for PropertyError {
+    /// Convert a Tokio JoinError into a PropertyError
+    ///
+    /// This enables using the `?` operator directly on `task::spawn(...).await`
+    /// which returns a `Result<T, JoinError>`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use tokio::task;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = Arc::new(ObservableProperty::new(0));
+    ///     let property_clone = property.clone();
+    ///
+    ///     // This task::spawn can now use ?? to propagate both types of errors
+    ///     task::spawn(async move {
+    ///         property_clone.set(42)?;
+    ///         Ok::<_, observable_property_tokio::PropertyError>(())
+    ///     }).await??;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    fn from(err: JoinError) -> Self {
+        PropertyError::JoinError(err.to_string())
     }
 }
