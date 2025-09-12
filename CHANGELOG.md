@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-09-12
+
+### Added
+- New `Subscription<T>` type providing RAII-style auto-cleanup
+- Added `subscribe_with_token()` method for automatic unsubscription when dropped
+- Added `subscribe_filtered_with_token()` method for filtered automatic unsubscription
+- Added `subscribe_async_with_token()` method for async automatic unsubscription
+- Added `subscribe_async_filtered_with_token()` method combining async and filtered behaviors
+
+### Fixed
+- Fixed subscription auto-cleanup in all token-based subscription methods
+- Corrected the implementation of `Subscription<T>` to properly remove observers when dropped
+- Improved reliability in multi-threaded environments with proper resource cleanup
+
+### Changed
+- Modified internal subscription storage to directly access inner data structures
+- Improved memory management with more efficient sharing of internal state
+
 ## [0.1.3] - 2025-09-03
 
 ### Added
