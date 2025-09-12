@@ -222,6 +222,19 @@ struct InnerProperty<T> {
     next_id: usize,
 }
 
+pub struct Subscription<T: Clone + Send + Sync + 'static> {
+    property: std::sync::Weak<ObservableProperty<T>>,
+    id: ObserverId,
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        if let Some(property) = self.property.upgrade() {
+            let _ = property.try_unsubscribe(self.id);
+        }
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// Creates a new observable property with the given initial value
     ///
@@ -903,6 +916,63 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         derived
     }
+
+    pub fn subscribe_with_token(&self, observer: Observer<T>) -> Result<Subscription<T>, PropertyError> {
+        let id = self.subscribe(observer)?;
+        let arc_self = Arc::new(self.clone());
+        Ok(Subscription {
+            property: Arc::downgrade(&arc_self),
+            id
+        })
+    }
+
+    pub fn subscribe_filtered_with_token<F>(
+        &self,
+        observer: Observer<T>,
+        filter: F,
+    ) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let id = self.subscribe_filtered(observer, filter)?;
+        let arc_self = Arc::new(self.clone());
+        Ok(Subscription {
+            property: Arc::downgrade(&arc_self),
+            id
+        })
+    }
+
+    pub fn subscribe_async_with_token<F, Fut>(&self, handler: F) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self.subscribe_async(handler)?;
+        let arc_self = Arc::new(self.clone());
+        Ok(Subscription {
+            property: Arc::downgrade(&arc_self),
+            id
+        })
+    }
+
+    pub fn subscribe_async_filtered_with_token<F, Fut, Filt>(
+        &self,
+        handler: F,
+        filter: Filt,
+    ) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Filt: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let id = self.subscribe_async_filtered(handler, filter)?;
+        let arc_self = Arc::new(self.clone());
+        Ok(Subscription {
+            property: Arc::downgrade(&arc_self),
+            id
+        })
+    }
+
 }
 
 impl<T: Clone + Send + Sync + 'static + Default> Default for ObservableProperty<T> {
