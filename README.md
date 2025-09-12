@@ -30,6 +30,9 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
 - **Proper error handling**: All operations return `Result` types instead of panicking
+- **RAII subscriptions**: Automatic cleanup of observers when subscription objects go out of scope
+- **Non-cloning references**: Access property values without cloning using `get_ref()`
+- **Property transformations**: Create derived properties with automatic value conversion
 
 ## 📦 Installation
 
@@ -37,7 +40,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property-tokio = "0.1.0"
+observable-property-tokio = "0.2.0"
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
 
@@ -68,6 +71,31 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     // Unsubscribe when done
     property.unsubscribe(observer_id)?;
 
+    Ok(())
+}
+```
+
+### Automatic Subscription Cleanup (RAII)
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let property = ObservableProperty::new(0);
+    
+    {
+        // Create a subscription that automatically unsubscribes when dropped
+        let _subscription = property.subscribe_with_token(Arc::new(|old, new| {
+            println!("Value changed: {} -> {}", old, new);
+        }))?;
+        
+        property.set(42)?; // Observer is notified
+    } // _subscription is dropped here, automatically unsubscribing
+    
+    property.set(100)?; // Observer is no longer notified
+    
     Ok(())
 }
 ```
@@ -122,6 +150,33 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
+### Property Mapping and Transformation
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let original = ObservableProperty::new(42);
+    
+    // Create a derived property that doubles the value
+    let doubled = original.map(|value| value * 2);
+    assert_eq!(doubled.get()?, 84);
+    
+    // Create a derived property that converts to string
+    let as_string = original.map(|value| format!("Value: {}", value));
+    assert_eq!(as_string.get()?, "Value: 42");
+    
+    // When original changes, all derived properties update automatically
+    original.set(10)?;
+    assert_eq!(doubled.get()?, 20);
+    assert_eq!(as_string.get()?, "Value: 10");
+    
+    Ok(())
+}
+```
+
 ### Multi-threading
 
 ```rust
@@ -157,14 +212,18 @@ The crate includes several examples demonstrating different usage patterns:
 - [`filtered_observers.rs`](examples/filtered_observers.rs) - Conditional observers
 - [`async_observers.rs`](examples/async_observers.rs) - Asynchronous observer handlers
 - [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
+- [`subscription_token.rs`](examples/subscription_token.rs) - RAII-style automatic subscription cleanup
+- [`property_mapping.rs`](examples/property_mapping.rs) - Creating derived properties with transformations
+- [`complex_data_type.rs`](examples/complex_data_type.rs) - Using with complex data structures
+- [`reference_and_async_filtered.rs`](examples/reference_and_async_filtered.rs) - Non-cloning access and async filtered subscriptions
 
 Run examples with:
 
 ```bash
 cargo run --example basic_usage
-cargo run --example filtered_observers
-cargo run --example async_observers
-cargo run --example multi_threading
+cargo run --example subscription_token
+cargo run --example property_mapping
+# ... and so on for other examples
 ```
 
 ## 🛠️ API Reference
@@ -175,17 +234,29 @@ cargo run --example multi_threading
 - `PropertyError` - Error type returned by all operations
 - `Observer<T>` - Type alias for observer functions: `Arc<dyn Fn(&T, &T) + Send + Sync>`
 - `ObserverId` - Unique identifier for observers
+- `Subscription<T>` - RAII subscription handle for automatic cleanup
 
 ### Key Methods
 
 - `new(initial_value: T)` - Create a new observable property
-- `get() -> Result<T, PropertyError>` - Get current value
+- `get() -> Result<T, PropertyError>` - Get current value (clones the value)
+- `get_ref() -> impl Deref<Target = T>` - Get reference to current value (no cloning)
 - `set(new_value: T) -> Result<(), PropertyError>` - Set value synchronously
 - `set_async(new_value: T) -> Result<(), PropertyError>` - Set value asynchronously
+- `update(F: FnOnce(T) -> T)` - Update value using a function
+- `update_async(F: FnOnce(T) -> T)` - Update value asynchronously using a function
 - `subscribe(observer: Observer<T>) -> Result<ObserverId, PropertyError>` - Add observer
+- `subscribe_with_token(observer: Observer<T>) -> Result<Subscription<T>, PropertyError>` - Add observer with automatic cleanup
 - `subscribe_async<F, Fut>(handler: F) -> Result<ObserverId, PropertyError>` - Add async observer
+- `subscribe_async_with_token<F, Fut>(handler: F) -> Result<Subscription<T>, PropertyError>` - Add async observer with automatic cleanup
 - `subscribe_filtered<F>(observer: Observer<T>, filter: F) -> Result<ObserverId, PropertyError>` - Add filtered observer
-- `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
+- `subscribe_filtered_with_token<F>(observer: Observer<T>, filter: F) -> Result<Subscription<T>, PropertyError>` - Add filtered observer with automatic cleanup
+- `subscribe_async_filtered<F, Fut, Filt>(handler: F, filter: Filt) -> Result<ObserverId, PropertyError>` - Add async filtered observer
+- `subscribe_async_filtered_with_token<F, Fut, Filt>(handler: F, filter: Filt) -> Result<Subscription<T>, PropertyError>` - Add async filtered observer with automatic cleanup
+- `unsubscribe(id: ObserverId) -> Result<(), PropertyError>` - Remove observer
+- `try_unsubscribe(id: ObserverId) -> bool` - Remove observer (ignores non-existent IDs)
+- `map<U, F>(&self, transform: F) -> ObservableProperty<U>` - Create derived property with transformation
+- `observer_count() -> usize` - Get the number of active observers
 
 ## ⚡ Performance Considerations
 
@@ -193,6 +264,7 @@ cargo run --example multi_threading
 - **Update Frequency**: High-frequency updates may benefit from batching or debouncing at the application level
 - **Memory Usage**: Observers are stored as `Arc<dyn Fn>` which has some memory overhead
 - **Lock Contention**: Uses `RwLock` which allows multiple readers but exclusive writers
+- **Reference Usage**: For large data structures, prefer `get_ref()` over `get()` to avoid cloning when appropriate
 
 ## 🤝 Contributing
 
@@ -217,7 +289,7 @@ This crate is a rework of the original `observable-property` crate to use Tokio 
 If you encounter any issues or have questions:
 
 1. Check the [documentation](https://docs.rs/observable-property-tokio)
-2. Look at the [examples](examples/)
+2. Look at the examples
 3. Search existing [issues](https://github.com/snoekiede/ObservablePropertiesTokio/issues)
 4. Create a new issue if needed
 

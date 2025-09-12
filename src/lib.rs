@@ -222,6 +222,40 @@ struct InnerProperty<T> {
     next_id: usize,
 }
 
+pub struct PropertyHandle<T: Clone + Send + Sync + 'static> {
+    inner: Arc<RwLock<InnerProperty<T>>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> PropertyHandle<T> {
+    /// Removes an observer by its ID, ignoring if it doesn't exist
+    ///
+    /// This is a convenience method that doesn't return an error if the observer doesn't exist.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The observer ID returned by `subscribe()`
+    ///
+    /// # Returns
+    ///
+    /// `true` if an observer was removed, `false` if no observer with that ID existed
+    pub fn try_unsubscribe(&self, id: ObserverId) -> bool {
+        let mut inner = self.inner.write();
+        inner.observers.remove(&id).is_some()
+    }
+}
+
+pub struct Subscription<T: Clone + Send + Sync + 'static> {
+    inner: Arc<RwLock<InnerProperty<T>>>,
+    id: ObserverId,
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        let mut inner = self.inner.write();
+        inner.observers.remove(&self.id);
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// Creates a new observable property with the given initial value
     ///
@@ -655,6 +689,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     ///     assert_eq!(property.observer_count(), 1);
     ///
+    ///     property.unsubscribe(id2)?;
+    ///
+    ///     assert_eq!(property.observer_count(), 0);
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -813,6 +851,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     ///     property.set(10)?; // Triggers observer (0 -> 10)
     ///     property.set(5)?;  // Does NOT trigger observer (10 -> 5)
+    ///     property.set(15)?; // Triggers observer (5 -> 15)
     ///
     ///     // Give time for observers to complete
     ///     sleep(Duration::from_millis(20)).await;
@@ -903,6 +942,59 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         derived
     }
+
+    pub fn subscribe_with_token(&self, observer: Observer<T>) -> Result<Subscription<T>, PropertyError> {
+        let id = self.subscribe(observer)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id
+        })
+    }
+
+    pub fn subscribe_filtered_with_token<F>(
+        &self,
+        observer: Observer<T>,
+        filter: F,
+    ) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let id = self.subscribe_filtered(observer, filter)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id
+        })
+    }
+
+    pub fn subscribe_async_with_token<F, Fut>(&self, handler: F) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self.subscribe_async(handler)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id
+        })
+    }
+
+    pub fn subscribe_async_filtered_with_token<F, Fut, Filt>(
+        &self,
+        handler: F,
+        filter: Filt,
+    ) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Filt: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let id = self.subscribe_async_filtered(handler, filter)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id
+        })
+    }
+
 }
 
 impl<T: Clone + Send + Sync + 'static + Default> Default for ObservableProperty<T> {
@@ -949,6 +1041,14 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     ///     Ok(())
     /// }
     /// ```
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Clone for PropertyHandle<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -1444,6 +1544,211 @@ mod tests {
 
         // Counter should be incremented after the async work completes
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_auto_cleanup() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        {
+            // Create a subscription in this scope
+            let _subscription = property.subscribe_with_token(Arc::new({
+                let counter = counter.clone();
+                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            }))?;
+
+            // Update should trigger the observer
+            property.set(1)?;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            // Subscription is still active within this scope
+            property.set(2)?;
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        } // _subscription is dropped here, should automatically unsubscribe
+
+        // After subscription is dropped, updates should not trigger the observer
+        property.set(3)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 2); // Counter should not increment
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filtered_subscription_auto_cleanup() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Only notify when value increases
+        let filter = |old: &i32, new: &i32| new > old;
+
+        {
+            // Create a filtered subscription in this scope
+            let _subscription = property.subscribe_filtered_with_token(
+                Arc::new({
+                    let counter = counter.clone();
+                    move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                }),
+                filter
+            )?;
+
+            property.set(10)?; // Should trigger (0 -> 10)
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            property.set(5)?; // Should NOT trigger (10 -> 5)
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            property.set(15)?; // Should trigger (5 -> 15)
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        } // _subscription is dropped here, should automatically unsubscribe
+
+        // After subscription is dropped, updates should not trigger the observer
+        property.set(20)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 2); // Counter should not increment
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_subscription_auto_cleanup() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone(); // Clone before passing to closure
+
+        {
+            // Create an async subscription in this scope
+            let _subscription = property.subscribe_async_with_token(move |_, _| {
+                let counter = counter_clone.clone(); // Use counter_clone instead of counter
+                async move {
+                    sleep(Duration::from_millis(10)).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })?;
+
+            property.set_async(1).await?;
+
+            // Give time for async operations to complete
+            sleep(Duration::from_millis(50)).await;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        } // _subscription is dropped here, should automatically unsubscribe
+
+        // After subscription is dropped, updates should not trigger the observer
+        property.set_async(2).await?;
+
+        // Give time for any potential async operations to complete
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter should not increment
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_filtered_subscription_auto_cleanup() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone(); // Clone before passing to closure
+
+        {
+            // Create an async filtered subscription in this scope
+            let _subscription = property.subscribe_async_filtered_with_token(
+                move |_, _| {
+                    let counter = counter_clone.clone(); // Use counter_clone instead of counter
+                    async move {
+                        sleep(Duration::from_millis(10)).await;
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                |old, new| new > old // Only trigger when value increases
+            )?;
+
+            property.set_async(10).await?; // Should trigger (0 -> 10)
+
+            // Give time for async operations to complete
+            sleep(Duration::from_millis(50)).await;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+            property.set_async(5).await?; // Should NOT trigger (10 -> 5)
+            sleep(Duration::from_millis(50)).await;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        } // _subscription is dropped here, should automatically unsubscribe
+
+        // After subscription is dropped, updates should not trigger the observer
+        property.set_async(15).await?; // Would have triggered with active subscription
+
+        // Give time for any potential async operations to complete
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter should not increment
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_subscriptions() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter1 = Arc::new(AtomicUsize::new(0));
+        let counter2 = Arc::new(AtomicUsize::new(0));
+
+        // First subscription
+        let subscription1 = property.subscribe_with_token(Arc::new({
+            let counter = counter1.clone();
+            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+        }))?;
+
+        // Second subscription
+        let subscription2 = property.subscribe_with_token(Arc::new({
+            let counter = counter2.clone();
+            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+        }))?;
+
+        // Both subscriptions should receive updates
+        property.set(1)?;
+        assert_eq!(counter1.load(Ordering::SeqCst), 1);
+        assert_eq!(counter2.load(Ordering::SeqCst), 1);
+
+        // Drop first subscription only
+        drop(subscription1);
+
+        // Only the second subscription should receive updates now
+        property.set(2)?;
+        assert_eq!(counter1.load(Ordering::SeqCst), 1); // Should not increment
+        assert_eq!(counter2.load(Ordering::SeqCst), 2); // Should increment
+
+        // Drop second subscription
+        drop(subscription2);
+
+        // No subscriptions should receive updates now
+        property.set(3)?;
+        assert_eq!(counter1.load(Ordering::SeqCst), 1);
+        assert_eq!(counter2.load(Ordering::SeqCst), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_with_property_drop() -> Result<(), PropertyError> {
+        // Create property in a scope so it can be dropped
+        let counter = Arc::new(AtomicUsize::new(0));
+        let subscription;
+
+        {
+            let property = ObservableProperty::new(0);
+
+            // Create subscription
+            subscription = property.subscribe_with_token(Arc::new({
+                let counter = counter.clone();
+                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            }))?;
+
+            // Subscription works normally
+            property.set(1)?;
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        } // property is dropped here, but subscription is still alive
+
+        // Subscription should be aware that property is gone when we drop it
+        // This should not panic or cause any issues
+        drop(subscription);
+
         Ok(())
     }
 }
