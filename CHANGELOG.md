@@ -8,31 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2025-09-29
 
 ### Added
-- `clear_observers()` method for removing all registered observers at once
-- `shutdown()` method for comprehensive cleanup operations
-- Comprehensive test coverage for cleanup methods (`test_cleanup_methods`)
-- Enhanced documentation examples showing resource management patterns
+- New `Subscription<T>` type providing RAII-style auto-cleanup
+- Added `subscribe_with_token()` method for automatic unsubscription when dropped
+- Added `subscribe_filtered_with_token()` method for filtered automatic unsubscription
+- Added `subscribe_async_with_token()` method for async automatic unsubscription
+- Added `subscribe_async_filtered_with_token()` method combining async and filtered behaviors
 
 ### Fixed
-- **Critical**: Fixed memory leak in `set_async()` method by properly awaiting spawned tasks
-- **Critical**: Eliminated potential panics in `map()` method by replacing `expect()` calls with proper error handling
-- Changed `map()` method return type from `ObservableProperty<U>` to `Result<ObservableProperty<U>, PropertyError>` for consistent error handling
-- All observer tasks are now properly awaited to prevent resource leaks in long-running applications
+- Fixed subscription auto-cleanup in all token-based subscription methods
+- Corrected the implementation of `Subscription<T>` to properly remove observers when dropped
+- Improved reliability in multi-threaded environments with proper resource cleanup
 
 ### Changed
-- Enhanced production readiness with proper resource management
-- Improved error propagation in `map()` method - no more unwrap/expect calls that could panic
-- Updated README.md with resource management examples and recent improvements section
-- All async operations now guarantee task completion before returning
-
-### Security
-- Eliminated all potential panic points in public API methods
-- Improved resource cleanup to prevent memory leaks in production environments
-
-### Breaking Changes
-- `map()` method now returns `Result<ObservableProperty<U>, PropertyError>` instead of `ObservableProperty<U>`
-  - **Migration**: Wrap existing `map()` calls with `?` or `.unwrap()` if error handling is not needed
-  - **Example**: Change `let derived = property.map(|x| x * 2);` to `let derived = property.map(|x| x * 2)?;`
+- Modified internal subscription storage to directly access inner data structures
+- Improved memory management with more efficient sharing of internal state
 
 ## [0.1.3] - 2025-09-03
 

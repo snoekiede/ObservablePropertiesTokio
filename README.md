@@ -129,6 +129,33 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
+### Property Mapping and Transformation
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let original = ObservableProperty::new(42);
+    
+    // Create a derived property that doubles the value
+    let doubled = original.map(|value| value * 2);
+    assert_eq!(doubled.get()?, 84);
+    
+    // Create a derived property that converts to string
+    let as_string = original.map(|value| format!("Value: {}", value));
+    assert_eq!(as_string.get()?, "Value: 42");
+    
+    // When original changes, all derived properties update automatically
+    original.set(10)?;
+    assert_eq!(doubled.get()?, 20);
+    assert_eq!(as_string.get()?, "Value: 10");
+    
+    Ok(())
+}
+```
+
 ### Multi-threading
 
 ```rust
@@ -200,14 +227,18 @@ The crate includes several examples demonstrating different usage patterns:
 - [`filtered_observers.rs`](examples/filtered_observers.rs) - Conditional observers
 - [`async_observers.rs`](examples/async_observers.rs) - Asynchronous observer handlers
 - [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
+- [`subscription_token.rs`](examples/subscription_token.rs) - RAII-style automatic subscription cleanup
+- [`property_mapping.rs`](examples/property_mapping.rs) - Creating derived properties with transformations
+- [`complex_data_type.rs`](examples/complex_data_type.rs) - Using with complex data structures
+- [`reference_and_async_filtered.rs`](examples/reference_and_async_filtered.rs) - Non-cloning access and async filtered subscriptions
 
 Run examples with:
 
 ```bash
 cargo run --example basic_usage
-cargo run --example filtered_observers
-cargo run --example async_observers
-cargo run --example multi_threading
+cargo run --example subscription_token
+cargo run --example property_mapping
+# ... and so on for other examples
 ```
 
 ## 🛠️ API Reference
@@ -218,15 +249,21 @@ cargo run --example multi_threading
 - `PropertyError` - Error type returned by all operations
 - `Observer<T>` - Type alias for observer functions: `Arc<dyn Fn(&T, &T) + Send + Sync>`
 - `ObserverId` - Unique identifier for observers
+- `Subscription<T>` - RAII subscription handle for automatic cleanup
 
 ### Key Methods
 
 - `new(initial_value: T)` - Create a new observable property
-- `get() -> Result<T, PropertyError>` - Get current value
+- `get() -> Result<T, PropertyError>` - Get current value (clones the value)
+- `get_ref() -> impl Deref<Target = T>` - Get reference to current value (no cloning)
 - `set(new_value: T) -> Result<(), PropertyError>` - Set value synchronously
 - `set_async(new_value: T) -> Result<(), PropertyError>` - Set value asynchronously
+- `update(F: FnOnce(T) -> T)` - Update value using a function
+- `update_async(F: FnOnce(T) -> T)` - Update value asynchronously using a function
 - `subscribe(observer: Observer<T>) -> Result<ObserverId, PropertyError>` - Add observer
+- `subscribe_with_token(observer: Observer<T>) -> Result<Subscription<T>, PropertyError>` - Add observer with automatic cleanup
 - `subscribe_async<F, Fut>(handler: F) -> Result<ObserverId, PropertyError>` - Add async observer
+- `subscribe_async_with_token<F, Fut>(handler: F) -> Result<Subscription<T>, PropertyError>` - Add async observer with automatic cleanup
 - `subscribe_filtered<F>(observer: Observer<T>, filter: F) -> Result<ObserverId, PropertyError>` - Add filtered observer
 - `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
 - `observer_count() -> usize` - Get number of registered observers
@@ -285,7 +322,7 @@ This crate is a rework of the original `observable-property` crate to use Tokio 
 If you encounter any issues or have questions:
 
 1. Check the [documentation](https://docs.rs/observable-property-tokio)
-2. Look at the [examples](examples/)
+2. Look at the examples
 3. Search existing [issues](https://github.com/snoekiede/ObservablePropertiesTokio/issues)
 4. Create a new issue if needed
 
