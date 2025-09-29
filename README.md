@@ -41,7 +41,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property-tokio = "0.2.0"
+observable-property-tokio = "0.3.0"
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
 
