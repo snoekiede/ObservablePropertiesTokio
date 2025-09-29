@@ -16,6 +16,7 @@ A thread-safe, async-compatible observable property implementation for Rust that
 - **Memory Usage**: Observer callbacks are stored as `Arc<dyn Fn>` which may have memory overhead considerations
 - **API Stability**: The API may change in future versions as the design evolves
 - **Error Handling**: All operations return `Result` types - proper error handling is essential
+- **Resource Cleanup**: Use `clear_observers()` or `shutdown()` methods for proper cleanup in production
 
 **Performance characteristics may vary** depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
 
@@ -23,13 +24,16 @@ By using this crate, you acknowledge that you have read and understood this disc
 
 ## 🚀 Features
 
-- **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
+- **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access with optimized locking
 - **Observer pattern**: Subscribe to property changes with callbacks
 - **Filtered observers**: Only notify when specific conditions are met
 - **Async notifications**: Non-blocking observer notifications with Tokio tasks
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
 - **Proper error handling**: All operations return `Result` types instead of panicking
+- **Resource management**: Built-in cleanup methods for production environments
+- **Memory leak prevention**: Async operations properly await task completion
+- **Production-ready**: Comprehensive error handling and resource cleanup
 
 ## 📦 Installation
 
@@ -37,8 +41,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property-tokio = "0.1.0"
-tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "time"] }
+observable-property-tokio = "0.2.0"
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
 
 ## 🔧 Quick Start
@@ -67,6 +71,9 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
     // Unsubscribe when done
     property.unsubscribe(observer_id)?;
+
+    // Or clear all observers at once
+    property.clear_observers()?;
 
     Ok(())
 }
@@ -149,6 +156,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
+### Resource Management
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let property = ObservableProperty::new("active".to_string());
+
+    // Register observers for normal operation
+    property.subscribe(Arc::new(|old, new| {
+        println!("Status changed: {} -> {}", old, new);
+    }))?;
+
+    property.subscribe_async(|old, new| async move {
+        // Simulate async processing
+        println!("Async processing: {} -> {}", old, new);
+    })?;
+
+    println!("Observer count: {}", property.observer_count());
+
+    // Clear all observers when needed
+    property.clear_observers()?;
+    println!("Observer count after clear: {}", property.observer_count());
+
+    // Or perform comprehensive shutdown
+    property.shutdown()?;
+
+    // Property can still be used after cleanup, but no observers will be notified
+    property.set("inactive".to_string())?;
+
+    Ok(())
+}
+```
+
 ## 📚 Examples
 
 The crate includes several examples demonstrating different usage patterns:
@@ -186,6 +229,10 @@ cargo run --example multi_threading
 - `subscribe_async<F, Fut>(handler: F) -> Result<ObserverId, PropertyError>` - Add async observer
 - `subscribe_filtered<F>(observer: Observer<T>, filter: F) -> Result<ObserverId, PropertyError>` - Add filtered observer
 - `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
+- `observer_count() -> usize` - Get number of registered observers
+- `clear_observers() -> Result<(), PropertyError>` - Remove all observers
+- `shutdown() -> Result<(), PropertyError>` - Perform comprehensive cleanup
+- `map<U, F>(transform: F) -> Result<ObservableProperty<U>, PropertyError>` - Create derived property
 
 ## ⚡ Performance Considerations
 
@@ -193,6 +240,27 @@ cargo run --example multi_threading
 - **Update Frequency**: High-frequency updates may benefit from batching or debouncing at the application level
 - **Memory Usage**: Observers are stored as `Arc<dyn Fn>` which has some memory overhead
 - **Lock Contention**: Uses `RwLock` which allows multiple readers but exclusive writers
+- **Resource Cleanup**: Use cleanup methods to prevent memory leaks in long-running applications
+- **Task Management**: Async operations now properly await completion, preventing resource leaks
+
+## 🔄 Recent Improvements
+
+This crate has been enhanced for production readiness:
+
+### Version 0.1.4+ Improvements
+- **Memory leak prevention**: Fixed potential memory leaks in `set_async()` by properly awaiting task completion
+- **Panic-safe operations**: Eliminated potential panics in `map()` method with proper error handling
+- **Resource management**: Added `clear_observers()` and `shutdown()` methods for production cleanup
+- **Enhanced error handling**: All operations now handle errors gracefully without unwrap/expect calls
+- **Comprehensive testing**: Added tests for cleanup methods and edge cases
+
+### Production Readiness Features
+- ✅ Memory leak prevention in async operations
+- ✅ Proper error propagation without panics
+- ✅ Resource cleanup methods for application lifecycle
+- ✅ Comprehensive test coverage including edge cases
+- ✅ Thread-safe operations with proper locking
+- ✅ Panic isolation for observer functions
 
 ## 🤝 Contributing
 

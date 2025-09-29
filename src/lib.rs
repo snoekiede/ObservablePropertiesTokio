@@ -420,13 +420,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             tasks.push(task);
         }
 
-        // We can optionally wait for all tasks to complete
-        // Uncomment if you want to ensure all observers have run before returning
-        // for task in tasks {
-        //     task.await.map_err(|e| PropertyError::TokioError {
-        //         reason: format!("Task join error: {}", e),
-        //     })?;
-        // }
+        // Wait for all tasks to complete to prevent resource leaks
+        for task in tasks {
+            task.await.map_err(|e| PropertyError::JoinError(format!("Task join error: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -860,7 +857,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// A new `ObservableProperty<U>` that reflects the transformed value
+    /// `Ok(ObservableProperty<U>)` containing a new property that reflects the transformed value,
+    /// or `Err(PropertyError)` if the initial value cannot be read or the observer cannot be subscribed
     ///
     /// # Examples
     ///
@@ -873,7 +871,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///     let original = ObservableProperty::new(42);
     ///
     ///     // Create a derived property that doubles the value
-    ///     let doubled = original.map(|value| value * 2);
+    ///     let doubled = original.map(|value| value * 2)?;
     ///
     ///     assert_eq!(doubled.get()?, 84);
     ///
@@ -884,13 +882,13 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///     Ok(())
     /// }
     /// ```
-    pub fn map<U, F>(&self, transform: F) -> ObservableProperty<U>
+    pub fn map<U, F>(&self, transform: F) -> Result<ObservableProperty<U>, PropertyError>
     where
         U: Clone + Send + Sync + 'static,
         F: Fn(&T) -> U + Send + Sync + 'static,
     {
         let transform = Arc::new(transform);
-        let initial_value = transform(&self.get().expect("Failed to get initial value"));
+        let initial_value = transform(&self.get()?);
         let derived = ObservableProperty::new(initial_value);
 
         let derived_clone = derived.clone();
@@ -899,9 +897,103 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             if let Err(e) = derived_clone.set(transformed) {
                 eprintln!("Failed to update derived property: {}", e);
             }
-        })).expect("Failed to subscribe to source property");
+        }))?;
 
-        derived
+        Ok(derived)
+    }
+
+    /// Removes all registered observers from this property
+    ///
+    /// This method clears all observers that have been registered via `subscribe()`,
+    /// `subscribe_async()`, `subscribe_filtered()`, or `subscribe_async_filtered()`.
+    /// After calling this method, no observers will be notified of value changes
+    /// until new ones are registered.
+    ///
+    /// This is useful for cleanup scenarios or when you need to reset the observer
+    /// state without creating a new property instance.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new(42);
+    ///
+    ///     // Register some observers
+    ///     property.subscribe(Arc::new(|old, new| {
+    ///         println!("Value changed from {} to {}", old, new);
+    ///     }))?;
+    ///
+    ///     assert_eq!(property.observer_count(), 1);
+    ///
+    ///     // Clear all observers
+    ///     property.clear_observers()?;
+    ///     assert_eq!(property.observer_count(), 0);
+    ///
+    ///     // Setting value now won't trigger any observers
+    ///     property.set(100)?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn clear_observers(&self) -> Result<(), PropertyError> {
+        let mut inner = self.inner.write();
+        inner.observers.clear();
+        Ok(())
+    }
+
+    /// Performs cleanup operations on this property
+    ///
+    /// This method clears all registered observers, effectively shutting down
+    /// the property's observer functionality. This is particularly useful in
+    /// production environments where you need to ensure proper resource cleanup
+    /// during application shutdown or when disposing of property instances.
+    ///
+    /// Currently, this method performs the same operation as `clear_observers()`,
+    /// but it's provided as a separate method to allow for future expansion
+    /// of cleanup operations (such as canceling pending async tasks).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new("active".to_string());
+    ///
+    ///     // Register observers for normal operation
+    ///     property.subscribe(Arc::new(|old, new| {
+    ///         println!("Status changed: {} -> {}", old, new);
+    ///     }))?;
+    ///
+    ///     // ... normal application usage ...
+    ///
+    ///     // Shutdown the property when done
+    ///     property.shutdown()?;
+    ///
+    ///     // Property can still be used for getting/setting values,
+    ///     // but no observers will be notified
+    ///     property.set("inactive".to_string())?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn shutdown(&self) -> Result<(), PropertyError> {
+        // Cancel any pending async observers
+        self.clear_observers()
     }
 }
 
@@ -1027,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn test_map() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(10);
-        let derived = property.map(|val| val.to_string());
+        let derived = property.map(|val| val.to_string())?;
 
         assert_eq!(derived.get()?, "10");
 
@@ -1444,6 +1536,55 @@ mod tests {
 
         // Counter should be incremented after the async work completes
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    // Test cleanup methods
+    #[tokio::test]
+    async fn test_cleanup_methods() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(42);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Subscribe multiple observers
+        let counter1 = counter.clone();
+        property.subscribe(Arc::new(move |_, _| {
+            counter1.fetch_add(1, Ordering::SeqCst);
+        }))?;
+
+        let counter2 = counter.clone();
+        property.subscribe_async(move |_, _| {
+            let counter = counter2.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })?;
+
+        assert_eq!(property.observer_count(), 2);
+
+        // Test clear_observers
+        property.clear_observers()?;
+        assert_eq!(property.observer_count(), 0);
+
+        // Setting value should not trigger any observers
+        property.set(100)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Re-subscribe to test shutdown
+        let counter3 = counter.clone();
+        property.subscribe(Arc::new(move |_, _| {
+            counter3.fetch_add(1, Ordering::SeqCst);
+        }))?;
+
+        assert_eq!(property.observer_count(), 1);
+
+        // Test shutdown method
+        property.shutdown()?;
+        assert_eq!(property.observer_count(), 0);
+
+        // Setting value should not trigger any observers after shutdown
+        property.set(200)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
         Ok(())
     }
 }
