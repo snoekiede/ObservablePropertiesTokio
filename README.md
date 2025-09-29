@@ -140,11 +140,11 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     let original = ObservableProperty::new(42);
     
     // Create a derived property that doubles the value
-    let doubled = original.map(|value| value * 2);
+    let doubled = original.map(|value| value * 2)?;
     assert_eq!(doubled.get()?, 84);
     
     // Create a derived property that converts to string
-    let as_string = original.map(|value| format!("Value: {}", value));
+    let as_string = original.map(|value| format!("Value: {}", value))?;
     assert_eq!(as_string.get()?, "Value: 42");
     
     // When original changes, all derived properties update automatically

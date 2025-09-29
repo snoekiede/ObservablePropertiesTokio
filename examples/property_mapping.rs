@@ -11,15 +11,15 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     println!("Original property value: {}", original.get()?);
 
     // Create a derived property that doubles the value
-    let doubled = original.map(|value| value * 2);
+    let doubled = original.map(|value| value * 2)?;
     println!("Doubled property value: {}", doubled.get()?);
 
     // Create a derived property that converts the number to a string
-    let as_string = original.map(|value| format!("The value is: {}", value));
+    let as_string = original.map(|value| format!("The value is: {}", value))?;
     println!("String property value: {}", as_string.get()?);
 
     // Create another derived property that checks if the value is even
-    let is_even = original.map(|value| value % 2 == 0);
+    let is_even = original.map(|value| value % 2 == 0)?;
     println!("Is even property value: {}", is_even.get()?);
 
     // When the original property changes, all derived properties update automatically
@@ -33,7 +33,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     println!("Is even property value: {}", is_even.get()?);
 
     // Chain transformations - create a property derived from the doubled property
-    let doubled_plus_ten = doubled.map(|value| value + 10);
+    let doubled_plus_ten = doubled.map(|value| value + 10)?;
     println!("\nDoubled plus ten: {}", doubled_plus_ten.get()?);
 
     // Change original again and see all derived properties update
