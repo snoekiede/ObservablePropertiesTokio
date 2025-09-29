@@ -284,9 +284,11 @@ cargo run --example property_mapping
 
 This crate has been enhanced for production readiness:
 
-### Version 0.1.4+ Improvements
+### Version 0.2.0+ Improvements
 - **Memory leak prevention**: Fixed potential memory leaks in `set_async()` by properly awaiting task completion
 - **Panic-safe operations**: Eliminated potential panics in `map()` method with proper error handling
+- **Breaking change**: `map()` method now returns `Result<ObservableProperty<U>, PropertyError>` for enhanced safety
+  - Migration: Add `?` to existing `map()` calls: `property.map(|x| x * 2)?`
 - **Resource management**: Added `clear_observers()` and `shutdown()` methods for production cleanup
 - **Enhanced error handling**: All operations now handle errors gracefully without unwrap/expect calls
 - **Comprehensive testing**: Added tests for cleanup methods and edge cases

@@ -13,15 +13,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `subscribe_filtered_with_token()` method for filtered automatic unsubscription
 - Added `subscribe_async_with_token()` method for async automatic unsubscription
 - Added `subscribe_async_filtered_with_token()` method combining async and filtered behaviors
+- `clear_observers()` method for removing all registered observers at once
+- `shutdown()` method for comprehensive cleanup operations
+- Enhanced documentation examples showing resource management patterns
 
 ### Fixed
+- **Critical**: Fixed memory leak in `set_async()` method by properly awaiting spawned tasks
+- **Critical**: Eliminated potential panics in `map()` method by replacing `expect()` calls with proper error handling
 - Fixed subscription auto-cleanup in all token-based subscription methods
 - Corrected the implementation of `Subscription<T>` to properly remove observers when dropped
 - Improved reliability in multi-threaded environments with proper resource cleanup
+- All observer tasks are now properly awaited to prevent resource leaks in long-running applications
 
 ### Changed
 - Modified internal subscription storage to directly access inner data structures
 - Improved memory management with more efficient sharing of internal state
+
+### Breaking Changes
+- `map()` method now returns `Result<ObservableProperty<U>, PropertyError>` instead of `ObservableProperty<U>`
+  - **Migration**: Wrap existing `map()` calls with `?` or handle the `Result` explicitly
+  - **Before**: `let derived = property.map(|x| x * 2);`
+  - **After**: `let derived = property.map(|x| x * 2)?;` or `let derived = property.map(|x| x * 2).unwrap();`
+- All panic-prone operations now return proper `Result` types for enhanced safety
+- Observer task management in `set_async()` now properly awaits completion, which may change timing behavior
 
 ## [0.1.3] - 2025-09-03
 
