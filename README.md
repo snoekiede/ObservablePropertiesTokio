@@ -28,6 +28,7 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Observer pattern**: Subscribe to property changes with callbacks
 - **Filtered observers**: Only notify when specific conditions are met
 - **Async notifications**: Non-blocking observer notifications with Tokio tasks
+- **Connection pooling**: Limit concurrent async tasks to prevent resource exhaustion
 - **Batching**: Reduce overhead for high-frequency updates with configurable intervals
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
@@ -234,6 +235,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
         max_observers: 100,              // Maximum number of observers
         max_pending_notifications: 50,   // Reserved for future use
         observer_timeout_ms: 5000,       // Reserved for future use
+        max_concurrent_async_tasks: 100, // Maximum concurrent async tasks (default: 100)
     };
 
     let property = ObservableProperty::new_with_config(0, config);
@@ -301,6 +303,79 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
+### Connection Pooling for Async Tasks
+
+```rust
+use observable_property_tokio::{ObservableProperty, PropertyConfig};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time::{sleep, Duration};
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    // Configure connection pooling to limit concurrent async tasks
+    let config = PropertyConfig {
+        max_observers: 1000,
+        max_pending_notifications: 100,
+        observer_timeout_ms: 5000,
+        max_concurrent_async_tasks: 5,  // Only 5 async tasks run concurrently
+    };
+
+    let property = ObservableProperty::new_with_config(0, config);
+    let concurrent_count = Arc::new(AtomicUsize::new(0));
+    let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+    // Subscribe 20 async observers that each take 100ms
+    for _ in 0..20 {
+        let counter = Arc::clone(&concurrent_count);
+        let max_counter = Arc::clone(&max_concurrent);
+
+        property.subscribe_async(move |old, new| {
+            let counter = Arc::clone(&counter);
+            let max_counter = Arc::clone(&max_counter);
+
+            async move {
+                let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                max_counter.fetch_max(current, Ordering::SeqCst);
+
+                // Simulate async work (database query, HTTP request, etc.)
+                sleep(Duration::from_millis(100)).await;
+
+                counter.fetch_sub(1, Ordering::SeqCst);
+                println!("Observer executed: {} -> {}", old, new);
+            }
+        })?;
+    }
+
+    // Trigger notification to all 20 observers
+    property.set_async(42).await?;
+
+    // Wait for all tasks to complete
+    sleep(Duration::from_millis(500)).await;
+
+    // Verify max concurrent was not exceeded
+    let max_reached = max_concurrent.load(Ordering::SeqCst);
+    println!("Max concurrent tasks: {} (limit: 5)", max_reached);
+    assert!(max_reached <= 5, "Connection pool limit was respected");
+
+    Ok(())
+}
+```
+
+**Benefits of Connection Pooling:**
+- **Prevents resource exhaustion**: Limits concurrent async tasks to prevent CPU/memory overload
+- **Predictable performance**: Bounded concurrency ensures consistent system behavior
+- **Backpressure for async**: Automatic queuing when limit is reached
+- **Works with all async observers**: `subscribe_async()` and `subscribe_async_filtered()`
+- **Configurable limits**: Adjust `max_concurrent_async_tasks` based on your workload
+
+**Production Recommendations:**
+- Default (100): Good for most applications
+- High load (50): If you have many frequent updates
+- Resource constrained (20): Limited CPU/memory environments
+- Heavy async work (10): If observers do expensive I/O operations
+- Testing (5): Easier to observe concurrency behavior
+
 ## 📚 Examples
 
 The crate includes several examples demonstrating different usage patterns:
@@ -311,6 +386,7 @@ The crate includes several examples demonstrating different usage patterns:
 - [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
 - [`batching.rs`](examples/batching.rs) - Batching for high-frequency updates with 10 scenarios
 - [`backpressure.rs`](examples/backpressure.rs) - Backpressure and rate limiting with configurable limits
+- [`connection_pooling.rs`](examples/connection_pooling.rs) - Connection pooling for async tasks to prevent resource exhaustion
 - [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) - Graceful shutdown with timeout and diagnostics
 - [`subscription_token.rs`](examples/subscription_token.rs) - RAII-style automatic subscription cleanup
 - [`property_mapping.rs`](examples/property_mapping.rs) - Creating derived properties with transformations

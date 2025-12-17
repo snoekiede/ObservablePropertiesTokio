@@ -319,6 +319,7 @@ impl PropertyError {
 ///     max_observers: 100,
 ///     max_pending_notifications: 50,
 ///     observer_timeout_ms: 5000,
+///     max_concurrent_async_tasks: 50,
 /// };
 ///
 /// let property = ObservableProperty::new_with_config(42, config);
@@ -346,6 +347,16 @@ pub struct PropertyConfig {
     ///
     /// Default: 5000ms
     pub observer_timeout_ms: u64,
+
+    /// Maximum number of concurrent async observer tasks
+    ///
+    /// This limit prevents resource exhaustion by limiting the number of
+    /// async observer notifications that can execute simultaneously.
+    /// When the limit is reached, new async notifications will wait until
+    /// a slot becomes available (using a semaphore for coordination).
+    ///
+    /// Default: 100
+    pub max_concurrent_async_tasks: usize,
 }
 
 impl Default for PropertyConfig {
@@ -354,6 +365,7 @@ impl Default for PropertyConfig {
             max_observers: 1000,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         }
     }
 }
@@ -500,6 +512,7 @@ impl fmt::Display for ObserverId {
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
     config: PropertyConfig,
+    async_task_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 struct InnerProperty<T> {
@@ -583,12 +596,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///     max_observers: 50,
     ///     max_pending_notifications: 100,
     ///     observer_timeout_ms: 3000,
+    ///     max_concurrent_async_tasks: 50,
     /// };
     ///
     /// let property = ObservableProperty::new_with_config(0, config);
     /// assert_eq!(property.get().unwrap(), 0);
     /// ```
     pub fn new_with_config(initial_value: T, config: PropertyConfig) -> Self {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_async_tasks));
+        
         Self {
             inner: Arc::new(RwLock::new(InnerProperty {
                 value: initial_value,
@@ -596,6 +612,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
             })),
             config,
+            async_task_semaphore: semaphore,
         }
     }
 
@@ -754,19 +771,24 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             return Ok(());
         }
 
-        // Spawn a separate Tokio task for each observer
+        // Spawn a separate Tokio task for each observer with semaphore-based connection pooling
         let mut tasks = Vec::with_capacity(observers_snapshot.len());
 
         for observer in observers_snapshot {
             let old_val = old_value.clone();
             let new_val = new_value.clone();
+            let semaphore = Arc::clone(&self.async_task_semaphore);
 
             let task = task::spawn(async move {
+                // Acquire permit from semaphore before executing observer
+                let _permit = semaphore.acquire().await.expect("Semaphore closed");
+                
                 if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     observer(&old_val, &new_val);
                 })) {
                     eprintln!("Observer panic in task: {:?}", e);
                 }
+                // Permit is automatically released when _permit is dropped
             });
 
             tasks.push(task);
@@ -1125,15 +1147,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     {
         // Wrap the handler in an Arc so we can clone it for each invocation
         let handler = Arc::new(handler);
+        let semaphore = Arc::clone(&self.async_task_semaphore);
 
         let observer = Arc::new(move |old: &T, new: &T| {
             let old_val = old.clone();
             let new_val = new.clone();
             // Clone the handler so we can move it into the task
             let handler_clone = Arc::clone(&handler);
+            let semaphore_clone = Arc::clone(&semaphore);
 
             tokio::spawn(async move {
+                // Acquire permit from semaphore before executing async handler
+                let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                 handler_clone(old_val, new_val).await;
+                // Permit is automatically released when _permit is dropped
             });
         });
 
@@ -1195,15 +1222,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     {
         let filter = Arc::new(filter);
         let handler = Arc::new(handler);
+        let semaphore = Arc::clone(&self.async_task_semaphore);
 
         let observer = Arc::new(move |old: &T, new: &T| {
             if filter(old, new) {
                 let old_val = old.clone();
                 let new_val = new.clone();
                 let handler_clone = Arc::clone(&handler);
+                let semaphore_clone = Arc::clone(&semaphore);
 
                 tokio::spawn(async move {
+                    // Acquire permit from semaphore before executing async handler
+                    let _permit = semaphore_clone.acquire().await.expect("Semaphore closed");
                     handler_clone(old_val, new_val).await;
+                    // Permit is automatically released when _permit is dropped
                 });
             }
         });
@@ -1547,6 +1579,7 @@ impl<T: Clone> Clone for ObservableProperty<T> {
         Self {
             inner: Arc::clone(&self.inner),
             config: self.config.clone(),
+            async_task_semaphore: Arc::clone(&self.async_task_semaphore),
         }
     }
 }
@@ -2319,6 +2352,7 @@ mod tests {
             max_observers: 5,
             max_pending_notifications: 10,
             observer_timeout_ms: 1000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(42, config);
@@ -2341,6 +2375,7 @@ mod tests {
             max_observers: 3,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(0, config);
@@ -2371,6 +2406,7 @@ mod tests {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(0, config);
@@ -2404,6 +2440,7 @@ mod tests {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(0, config);
@@ -2432,6 +2469,7 @@ mod tests {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(0, config);
@@ -2471,6 +2509,7 @@ mod tests {
             max_observers: 3,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property1 = ObservableProperty::new_with_config(0, config);
@@ -2498,6 +2537,7 @@ mod tests {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         };
 
         let property = ObservableProperty::new_with_config(0, config);
@@ -3530,5 +3570,269 @@ impl From<JoinError> for PropertyError {
     /// ```
     fn from(err: JoinError) -> Self {
         PropertyError::JoinError(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod connection_pool_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn test_concurrent_task_limiting() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 1000,
+            max_pending_notifications: 1000,
+            observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 5, // Only 5 concurrent tasks allowed
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+        let concurrent_count = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        // Subscribe 20 async observers that all take 100ms to execute
+        for _ in 0..20 {
+            let counter = Arc::clone(&concurrent_count);
+            let max_counter = Arc::clone(&max_concurrent);
+
+            property.subscribe_async(move |_, _| {
+                let counter = Arc::clone(&counter);
+                let max_counter = Arc::clone(&max_counter);
+
+                async move {
+                    // Increment concurrent count
+                    let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+                    // Update max if needed
+                    max_counter.fetch_max(current, Ordering::SeqCst);
+
+                    // Simulate work
+                    sleep(Duration::from_millis(100)).await;
+
+                    // Decrement concurrent count
+                    counter.fetch_sub(1, Ordering::SeqCst);
+                }
+            })?;
+        }
+
+        // Trigger notification to all observers
+        property.set_async(42).await?;
+
+        // Wait for all tasks to complete
+        sleep(Duration::from_millis(500)).await;
+
+        // Verify max concurrent was not exceeded
+        let max_reached = max_concurrent.load(Ordering::SeqCst);
+        println!(
+            "Max concurrent tasks: {} (limit: 5)",
+            max_reached
+        );
+
+        assert!(
+            max_reached <= 5,
+            "Expected max concurrent tasks <= 5, but got {}",
+            max_reached
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_semaphore_blocks_when_max_reached() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 100,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 2, // Very low limit
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+        let execution_order = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+        // Add 5 observers with delays to test blocking
+        for i in 0..5 {
+            let order = Arc::clone(&execution_order);
+            property.subscribe_async(move |_, _| {
+                let order = Arc::clone(&order);
+                async move {
+                    order.write().push((i, "start"));
+                    sleep(Duration::from_millis(50)).await;
+                    order.write().push((i, "end"));
+                }
+            })?;
+        }
+
+        // Trigger notification
+        property.set_async(100).await?;
+
+        // Wait for all to complete
+        sleep(Duration::from_millis(300)).await;
+
+        let order = execution_order.read();
+        println!("Execution order: {:?}", *order);
+
+        // Verify that we have start/end pairs
+        assert_eq!(order.len(), 10, "Should have 5 start and 5 end events");
+
+        // Verify all tasks completed
+        let starts = order.iter().filter(|(_, phase)| *phase == "start").count();
+        let ends = order.iter().filter(|(_, phase)| *phase == "end").count();
+        assert_eq!(starts, 5, "Should have 5 starts");
+        assert_eq!(ends, 5, "Should have 5 ends");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_permits_released_after_execution() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 100,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 3,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        // Add 10 observers
+        for _ in 0..10 {
+            let counter = Arc::clone(&executions);
+            property.subscribe_async(move |_, _| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })?;
+        }
+
+        // Multiple notifications to test permit reuse
+        for _ in 0..3 {
+            property.set_async(42).await?;
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // Verify all executions happened (10 observers * 3 notifications = 30)
+        let total = executions.load(Ordering::SeqCst);
+        assert_eq!(total, 30, "Expected 30 executions, got {}", total);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filtered_async_observers_respect_limit() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 100,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 3,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+        let concurrent_count = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        // Add 10 filtered async observers
+        for _ in 0..10 {
+            let counter = Arc::clone(&concurrent_count);
+            let max_counter = Arc::clone(&max_concurrent);
+
+            property.subscribe_async_filtered(
+                move |_, _| {
+                    let counter = Arc::clone(&counter);
+                    let max_counter = Arc::clone(&max_counter);
+
+                    async move {
+                        let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_counter.fetch_max(current, Ordering::SeqCst);
+                        sleep(Duration::from_millis(50)).await;
+                        counter.fetch_sub(1, Ordering::SeqCst);
+                    }
+                },
+                |_, &new| new % 2 == 0, // Only trigger on even values
+            )?;
+        }
+
+        // Trigger with even value
+        property.set_async(100).await?;
+        sleep(Duration::from_millis(200)).await;
+
+        let max_reached = max_concurrent.load(Ordering::SeqCst);
+        println!("Max concurrent filtered async tasks: {}", max_reached);
+
+        assert!(
+            max_reached <= 3,
+            "Expected max concurrent tasks <= 3, got {}",
+            max_reached
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_default_concurrent_limit() -> Result<(), PropertyError> {
+        // Default config should have max_concurrent_async_tasks = 100
+        let property = ObservableProperty::new(0);
+
+        // Add 200 async observers
+        for _ in 0..200 {
+            property.subscribe_async(|_, _| async move {
+                sleep(Duration::from_millis(50)).await;
+            })?;
+        }
+
+        // This should work without blocking indefinitely
+        property.set_async(42).await?;
+        sleep(Duration::from_millis(300)).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mixed_sync_and_async_observers() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 100,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 2,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+        let sync_count = Arc::new(AtomicUsize::new(0));
+        let async_count = Arc::new(AtomicUsize::new(0));
+
+        // Add sync observers (these are not limited by semaphore)
+        for _ in 0..5 {
+            let counter = Arc::clone(&sync_count);
+            property.subscribe(Arc::new(move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }))?;
+        }
+
+        // Add async observers (these ARE limited by semaphore)
+        for _ in 0..5 {
+            let counter = Arc::clone(&async_count);
+            property.subscribe_async(move |_, _| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    sleep(Duration::from_millis(20)).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })?;
+        }
+
+        property.set_async(100).await?;
+        sleep(Duration::from_millis(150)).await;
+
+        // All sync observers should have executed immediately
+        assert_eq!(sync_count.load(Ordering::SeqCst), 5);
+
+        // All async observers should have executed (even if limited)
+        assert_eq!(async_count.load(Ordering::SeqCst), 5);
+
+        Ok(())
     }
 }

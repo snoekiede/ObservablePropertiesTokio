@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_observers: 5,
         max_pending_notifications: 10,
         observer_timeout_ms: 3000,
+        max_concurrent_async_tasks: 100,
     };
     
     let property = ObservableProperty::new_with_config(0, config);
@@ -66,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_observers: 3,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         },
     );
     
@@ -105,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         },
     );
 
@@ -135,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_observers: 2,
             max_pending_notifications: 100,
             observer_timeout_ms: 5000,
+            max_concurrent_async_tasks: 100,
         },
     );
 
