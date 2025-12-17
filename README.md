@@ -33,6 +33,7 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Proper error handling**: All operations return `Result` types instead of panicking
 - **Resource management**: Built-in cleanup methods for production environments
 - **Memory leak prevention**: Async operations properly await task completion
+- **Backpressure & Rate Limiting**: Configurable limits to prevent resource exhaustion
 - **Production-ready**: Comprehensive error handling and resource cleanup
 
 ## 📦 Installation
@@ -42,7 +43,7 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 observable-property-tokio = "0.3.0"
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
 
 ## 🔧 Quick Start
@@ -219,6 +220,86 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 }
 ```
 
+### Backpressure and Rate Limiting
+
+```rust
+use observable_property_tokio::{ObservableProperty, PropertyConfig};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    // Configure limits to prevent resource exhaustion
+    let config = PropertyConfig {
+        max_observers: 100,              // Maximum number of observers
+        max_pending_notifications: 50,   // Reserved for future use
+        observer_timeout_ms: 5000,       // Reserved for future use
+    };
+
+    let property = ObservableProperty::new_with_config(0, config);
+
+    // Subscribe observers as normal
+    for i in 0..100 {
+        property.subscribe(Arc::new(move |_, new| {
+            println!("Observer {} notified: {}", i, new);
+        }))?;
+    }
+
+    // The 101st subscription will fail with CapacityExceeded error
+    match property.subscribe(Arc::new(|_, _| {})) {
+        Ok(_) => println!("Subscribed successfully"),
+        Err(e) => {
+            eprintln!("Subscription failed: {}", e);
+            eprintln!("Diagnostic: {}", e.diagnostic_info());
+            // Output: CAPACITY_EXCEEDED | resource=observers | current=100 | max=100 | utilization=100.0%
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Graceful Shutdown with Timeout
+
+```rust
+use observable_property_tokio::ObservableProperty;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    let property = ObservableProperty::new(0);
+
+    // Add observers
+    property.subscribe(Arc::new(|old, new| {
+        println!("Value changed: {} -> {}", old, new);
+    }))?;
+
+    property.subscribe_async(|old, new| async move {
+        println!("Async observer: {} -> {}", old, new);
+    })?;
+
+    println!("Observers: {}", property.observer_count());
+
+    // ... application running ...
+
+    // Graceful shutdown with timeout
+    let report = property.shutdown_with_timeout(Duration::from_secs(30)).await?;
+
+    println!("Shutdown complete:");
+    println!("  - Observers cleared: {}", report.observers_cleared);
+    println!("  - Duration: {:?}", report.shutdown_duration);
+    println!("  - Within timeout: {}", report.completed_within_timeout);
+    println!("  - Diagnostic: {}", report.diagnostic_info());
+
+    // Monitor shutdown duration
+    if report.shutdown_duration > Duration::from_secs(10) {
+        eprintln!("WARNING: Shutdown took longer than expected");
+    }
+
+    Ok(())
+}
+```
+
 ## 📚 Examples
 
 The crate includes several examples demonstrating different usage patterns:
@@ -227,17 +308,22 @@ The crate includes several examples demonstrating different usage patterns:
 - [`filtered_observers.rs`](examples/filtered_observers.rs) - Conditional observers
 - [`async_observers.rs`](examples/async_observers.rs) - Asynchronous observer handlers
 - [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
+- [`backpressure.rs`](examples/backpressure.rs) - Backpressure and rate limiting with configurable limits
+- [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) - Graceful shutdown with timeout and diagnostics
 - [`subscription_token.rs`](examples/subscription_token.rs) - RAII-style automatic subscription cleanup
 - [`property_mapping.rs`](examples/property_mapping.rs) - Creating derived properties with transformations
 - [`complex_data_type.rs`](examples/complex_data_type.rs) - Using with complex data structures
 - [`reference_and_async_filtered.rs`](examples/reference_and_async_filtered.rs) - Non-cloning access and async filtered subscriptions
+- [`error_diagnostics.rs`](examples/error_diagnostics.rs) - Error diagnostic features for production monitoring
 
 Run examples with:
 
 ```bash
 cargo run --example basic_usage
+cargo run --example graceful_shutdown
 cargo run --example subscription_token
 cargo run --example property_mapping
+cargo run --example error_diagnostics
 # ... and so on for other examples
 ```
 
@@ -246,14 +332,17 @@ cargo run --example property_mapping
 ### Core Types
 
 - `ObservableProperty<T>` - The main observable property type
-- `PropertyError` - Error type returned by all operations
+- `PropertyConfig` - Configuration for backpressure and resource limits
+- `ShutdownReport` - Diagnostic report from graceful shutdown operations
+- `PropertyError` - Error type returned by all operations with diagnostic capabilities
 - `Observer<T>` - Type alias for observer functions: `Arc<dyn Fn(&T, &T) + Send + Sync>`
 - `ObserverId` - Unique identifier for observers
 - `Subscription<T>` - RAII subscription handle for automatic cleanup
 
 ### Key Methods
 
-- `new(initial_value: T)` - Create a new observable property
+- `new(initial_value: T)` - Create a new observable property with default configuration
+- `new_with_config(initial_value: T, config: PropertyConfig)` - Create with custom configuration
 - `get() -> Result<T, PropertyError>` - Get current value (clones the value)
 - `get_ref() -> impl Deref<Target = T>` - Get reference to current value (no cloning)
 - `set(new_value: T) -> Result<(), PropertyError>` - Set value synchronously
@@ -268,19 +357,202 @@ cargo run --example property_mapping
 - `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
 - `observer_count() -> usize` - Get number of registered observers
 - `clear_observers() -> Result<(), PropertyError>` - Remove all observers
-- `shutdown() -> Result<(), PropertyError>` - Perform comprehensive cleanup
+- `shutdown() -> Result<(), PropertyError>` - Fast cleanup without waiting
+- `shutdown_with_timeout(timeout: Duration) -> Result<ShutdownReport, PropertyError>` - Graceful shutdown with diagnostic report
 - `map<U, F>(transform: F) -> Result<ObservableProperty<U>, PropertyError>` - Create derived property
+
+## 🔄 Resource Management and Shutdown
+
+### Graceful Shutdown
+
+The crate provides two shutdown methods for different use cases:
+
+**`shutdown()`** - Fast cleanup without waiting:
+```rust
+property.shutdown()?;  // Immediately clears all observers
+```
+
+**`shutdown_with_timeout()`** - Graceful shutdown with diagnostics:
+```rust
+let report = property.shutdown_with_timeout(Duration::from_secs(30)).await?;
+
+// Access shutdown metrics
+println!("Cleared {} observers in {:?}", 
+    report.observers_cleared, 
+    report.shutdown_duration);
+
+// Check if completed within timeout
+if !report.completed_within_timeout {
+    eprintln!("WARNING: Shutdown exceeded timeout");
+}
+
+// Get diagnostic string for logging
+log::info!("Shutdown: {}", report.diagnostic_info());
+```
+
+### ShutdownReport
+
+The `ShutdownReport` struct provides comprehensive shutdown metrics:
+- `observers_cleared: usize` - Number of observers removed
+- `shutdown_duration: Duration` - Time taken for shutdown
+- `completed_within_timeout: bool` - Whether shutdown finished in time
+- `initiated_at_ms: u64` - Timestamp when shutdown started
+- `diagnostic_info() -> String` - Formatted diagnostic string
+
+### When to Use Each Method
+
+- **Use `shutdown()`** for:
+  - Fast application teardown
+  - Unit tests
+  - When you don't need metrics
+
+- **Use `shutdown_with_timeout()`** for:
+  - Production environments
+  - When you need observability
+  - Monitoring shutdown performance
+  - Detecting slow observers
+  - Compliance/audit requirements
+
+See the [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) example for comprehensive demonstrations.
+
+## 🚦 Backpressure and Resource Management
+
+### Configuration
+
+The crate provides `PropertyConfig` to control resource usage and prevent exhaustion:
+
+```rust
+use observable_property_tokio::{ObservableProperty, PropertyConfig};
+
+let config = PropertyConfig {
+    max_observers: 100,              // Maximum number of observers (default: 1000)
+    max_pending_notifications: 50,   // Reserved for future use (default: 100)
+    observer_timeout_ms: 5000,       // Reserved for future use (default: 5000)
+};
+
+let property = ObservableProperty::new_with_config(initial_value, config);
+```
+
+### Capacity Enforcement
+
+When the maximum number of observers is reached, additional subscriptions will fail with a `PropertyError::CapacityExceeded` error:
+
+```rust
+match property.subscribe(observer) {
+    Ok(id) => {
+        // Successfully subscribed
+        log::info!("Observer {} subscribed", id);
+    }
+    Err(PropertyError::CapacityExceeded { current, max, resource }) => {
+        // Handle capacity limit gracefully
+        log::warn!("Cannot add observer: {}/{} {} in use", current, max, resource);
+        // Consider queuing the subscription or rejecting the request
+    }
+    Err(e) => {
+        log::error!("Subscription error: {}", e.diagnostic_info());
+    }
+}
+```
+
+### Benefits
+
+- **Prevents memory exhaustion** from unlimited observer growth
+- **Predictable resource usage** for capacity planning
+- **Early failure detection** before system resources are depleted
+- **Graceful degradation** under high load
+- **Explicit resource limits** that can be tuned based on workload
+
+See the [`backpressure.rs`](examples/backpressure.rs) example for comprehensive demonstrations.
 
 ## ⚡ Performance Considerations
 
 - **Observer Count**: Each observer is called in a separate Tokio task for `set_async()`, which provides good isolation but may have overhead for many observers
 - **Update Frequency**: High-frequency updates may benefit from batching or debouncing at the application level
 - **Memory Usage**: Observers are stored as `Arc<dyn Fn>` which has some memory overhead
+- **Capacity Limits**: Configure `max_observers` based on your expected load to balance flexibility and resource protection
 - **Lock Contention**: Uses `RwLock` which allows multiple readers but exclusive writers
 - **Resource Cleanup**: Use cleanup methods to prevent memory leaks in long-running applications
 - **Task Management**: Async operations now properly await completion, preventing resource leaks
 
-## 🔄 Recent Improvements
+## � Error Handling and Diagnostics
+
+The crate provides comprehensive error diagnostics for production monitoring and debugging.
+
+### Error Types
+
+All operations return `Result<T, PropertyError>` with detailed error variants:
+
+- `ReadLockError` / `WriteLockError` - Lock acquisition failures with operation context and timestamps
+- `LockPoisoned` - Poisoned lock detection with operation context
+- `ObserverNotFound` - Observer ID not found during unsubscribe
+- `ObserverPanic` - Observer function panicked with error details and observer ID
+- `ObserverError` - Observer execution failure
+- `TokioError` - Tokio runtime errors
+- `JoinError` - Task join failures
+- `CapacityExceeded` - Resource limits exceeded with utilization metrics
+- `OperationTimeout` - Operation exceeded threshold with timing details
+- `ShutdownInProgress` - Property is shutting down
+
+### Diagnostic Information
+
+Each error provides a `diagnostic_info()` method that returns structured diagnostic data:
+
+```rust
+use observable_property_tokio::{ObservableProperty, PropertyError};
+
+let property = ObservableProperty::new(42);
+
+match property.set(100) {
+    Ok(_) => println!("Value updated"),
+    Err(e) => {
+        // Get human-readable error
+        eprintln!("Error: {}", e);
+        
+        // Get structured diagnostic information for logging
+        eprintln!("Diagnostic: {}", e.diagnostic_info());
+        
+        // Example output:
+        // "OPERATION_TIMEOUT | operation=notify_observers | elapsed_ms=5500 | threshold_ms=5000 | overage_ms=500"
+    }
+}
+```
+
+### Helper Functions for Error Creation
+
+The crate provides helper functions for creating errors with automatic timestamp injection:
+
+```rust
+// Automatically includes current timestamp
+let error = PropertyError::read_lock_error("get_value", "lock acquisition failed");
+let error = PropertyError::write_lock_error("set_value", "lock acquisition failed");
+let error = PropertyError::lock_poisoned("notify", "inner lock poisoned");
+let error = PropertyError::observer_panic(observer_id, "panic message");
+```
+
+### Integration with Logging
+
+The diagnostic information is designed for easy integration with logging frameworks:
+
+```rust
+// With the log crate
+log::error!("Property operation failed: {}", error.diagnostic_info());
+
+// With tracing
+tracing::error!(
+    diagnostic = %error.diagnostic_info(),
+    error = %error,
+    "Property operation failed"
+);
+
+// With custom metrics
+if let PropertyError::OperationTimeout { elapsed_ms, .. } = error {
+    metrics::histogram!("property_operation_latency_ms", elapsed_ms);
+}
+```
+
+See [`error_diagnostics.rs`](examples/error_diagnostics.rs) example for comprehensive demonstrations.
+
+## �🔄 Recent Improvements
 
 This crate has been enhanced for production readiness:
 

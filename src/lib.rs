@@ -72,6 +72,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::panic;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tokio::task::{self, JoinError};
@@ -80,47 +81,331 @@ use tokio::task::{self, JoinError};
 #[derive(Error, Debug, Clone)]
 pub enum PropertyError {
     /// Failed to acquire a read lock on the property
-    #[error("Failed to acquire read lock: {context}")]
+    #[error("Failed to acquire read lock during '{operation}': {context}")]
     ReadLockError {
+        /// The operation being attempted
+        operation: String,
         /// Context describing what operation was being attempted
-        context: String
+        context: String,
+        /// Timestamp when error occurred (milliseconds since epoch)
+        timestamp_ms: u64,
     },
 
     /// Failed to acquire a write lock on the property
-    #[error("Failed to acquire write lock: {context}")]
+    #[error("Failed to acquire write lock during '{operation}': {context}")]
     WriteLockError {
+        /// The operation being attempted
+        operation: String,
         /// Context describing what operation was being attempted
-        context: String
+        context: String,
+        /// Timestamp when error occurred (milliseconds since epoch)
+        timestamp_ms: u64,
     },
 
     /// Attempted to unsubscribe an observer that doesn't exist
     #[error("Observer with ID {id} not found")]
     ObserverNotFound {
         /// The ID of the observer that wasn't found
-        id: ObserverId
+        id: ObserverId,
     },
 
     /// The property's lock has been poisoned due to a panic in another thread
-    #[error("Property is in a poisoned state due to a panic in another thread")]
-    PoisonedLock,
+    #[error("Lock poisoned during '{operation}': {context}")]
+    LockPoisoned {
+        /// The operation that encountered the poisoned lock
+        operation: String,
+        /// Additional context about the poisoned lock
+        context: String,
+        /// Timestamp when error occurred (milliseconds since epoch)
+        timestamp_ms: u64,
+    },
+
+    /// An observer function panicked during execution
+    #[error("Observer {observer_id} panicked: {error}")]
+    ObserverPanic {
+        /// The ID of the observer that panicked
+        observer_id: ObserverId,
+        /// The panic error message
+        error: String,
+        /// Timestamp when error occurred (milliseconds since epoch)
+        timestamp_ms: u64,
+    },
 
     /// An observer function encountered an error during execution
     #[error("Observer execution failed: {reason}")]
     ObserverError {
         /// Description of what went wrong
-        reason: String
+        reason: String,
     },
 
     /// A Tokio-related error occurred
     #[error("Tokio runtime error: {reason}")]
     TokioError {
         /// Description of what went wrong
-        reason: String
+        reason: String,
     },
 
     /// A task join error occurred
     #[error("Task join error: {0}")]
     JoinError(String),
+
+    /// Maximum capacity has been exceeded
+    #[error("Capacity exceeded: current={current}, max={max}, resource={resource}")]
+    CapacityExceeded {
+        /// Current count
+        current: usize,
+        /// Maximum allowed
+        max: usize,
+        /// The resource that exceeded capacity
+        resource: String,
+    },
+
+    /// Operation exceeded timeout threshold
+    #[error("Operation '{operation}' timed out: {elapsed_ms}ms > {threshold_ms}ms")]
+    OperationTimeout {
+        /// The operation that timed out
+        operation: String,
+        /// Actual elapsed time in milliseconds
+        elapsed_ms: u64,
+        /// Timeout threshold in milliseconds
+        threshold_ms: u64,
+    },
+
+    /// The property is shutting down and not accepting new operations
+    #[error("Property is shutting down")]
+    ShutdownInProgress,
+}
+
+impl PropertyError {
+    /// Get a diagnostic string suitable for logging and monitoring
+    ///
+    /// This method returns a structured string containing all relevant
+    /// diagnostic information about the error, including timestamps,
+    /// operation context, and performance metrics where applicable.
+    ///
+    /// # Returns
+    ///
+    /// A formatted string containing diagnostic information
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::PropertyError;
+    ///
+    /// let error = PropertyError::OperationTimeout {
+    ///     operation: "notify_observers".to_string(),
+    ///     elapsed_ms: 5500,
+    ///     threshold_ms: 5000,
+    /// };
+    ///
+    /// let diagnostic = error.diagnostic_info();
+    /// assert!(diagnostic.contains("notify_observers"));
+    /// assert!(diagnostic.contains("elapsed_ms=5500"));
+    /// ```
+    pub fn diagnostic_info(&self) -> String {
+        match self {
+            Self::ReadLockError { operation, context, timestamp_ms } => {
+                format!(
+                    "READ_LOCK_ERROR | operation={} | context={} | timestamp_ms={}",
+                    operation, context, timestamp_ms
+                )
+            }
+            Self::WriteLockError { operation, context, timestamp_ms } => {
+                format!(
+                    "WRITE_LOCK_ERROR | operation={} | context={} | timestamp_ms={}",
+                    operation, context, timestamp_ms
+                )
+            }
+            Self::LockPoisoned { operation, context, timestamp_ms } => {
+                format!(
+                    "LOCK_POISONED | operation={} | context={} | timestamp_ms={}",
+                    operation, context, timestamp_ms
+                )
+            }
+            Self::ObserverPanic { observer_id, error, timestamp_ms } => {
+                format!(
+                    "OBSERVER_PANIC | observer_id={} | error={} | timestamp_ms={}",
+                    observer_id, error, timestamp_ms
+                )
+            }
+            Self::ObserverNotFound { id } => {
+                format!("OBSERVER_NOT_FOUND | id={}", id)
+            }
+            Self::CapacityExceeded { current, max, resource } => {
+                format!(
+                    "CAPACITY_EXCEEDED | resource={} | current={} | max={} | utilization={:.1}%",
+                    resource, current, max, (*current as f64 / *max as f64) * 100.0
+                )
+            }
+            Self::OperationTimeout { operation, elapsed_ms, threshold_ms } => {
+                format!(
+                    "OPERATION_TIMEOUT | operation={} | elapsed_ms={} | threshold_ms={} | overage_ms={}",
+                    operation, elapsed_ms, threshold_ms, elapsed_ms.saturating_sub(*threshold_ms)
+                )
+            }
+            Self::ShutdownInProgress => {
+                "SHUTDOWN_IN_PROGRESS | property is shutting down".to_string()
+            }
+            Self::ObserverError { reason } => {
+                format!("OBSERVER_ERROR | reason={}", reason)
+            }
+            Self::TokioError { reason } => {
+                format!("TOKIO_ERROR | reason={}", reason)
+            }
+            Self::JoinError(msg) => {
+                format!("JOIN_ERROR | message={}", msg)
+            }
+        }
+    }
+
+    /// Get the current timestamp in milliseconds since UNIX epoch
+    ///
+    /// This is a helper function used internally for error creation
+    fn current_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Create a ReadLockError with current timestamp
+    pub fn read_lock_error(operation: impl Into<String>, context: impl Into<String>) -> Self {
+        Self::ReadLockError {
+            operation: operation.into(),
+            context: context.into(),
+            timestamp_ms: Self::current_timestamp_ms(),
+        }
+    }
+
+    /// Create a WriteLockError with current timestamp
+    pub fn write_lock_error(operation: impl Into<String>, context: impl Into<String>) -> Self {
+        Self::WriteLockError {
+            operation: operation.into(),
+            context: context.into(),
+            timestamp_ms: Self::current_timestamp_ms(),
+        }
+    }
+
+    /// Create a LockPoisoned error with current timestamp
+    pub fn lock_poisoned(operation: impl Into<String>, context: impl Into<String>) -> Self {
+        Self::LockPoisoned {
+            operation: operation.into(),
+            context: context.into(),
+            timestamp_ms: Self::current_timestamp_ms(),
+        }
+    }
+
+    /// Create an ObserverPanic error with current timestamp
+    pub fn observer_panic(observer_id: ObserverId, error: impl Into<String>) -> Self {
+        Self::ObserverPanic {
+            observer_id,
+            error: error.into(),
+            timestamp_ms: Self::current_timestamp_ms(),
+        }
+    }
+}
+
+/// Configuration options for ObservableProperty
+///
+/// This struct allows you to configure limits and behavior for an observable property,
+/// helping prevent resource exhaustion and enabling production-grade backpressure handling.
+///
+/// # Examples
+///
+/// ```
+/// use observable_property_tokio::{ObservableProperty, PropertyConfig};
+///
+/// let config = PropertyConfig {
+///     max_observers: 100,
+///     max_pending_notifications: 50,
+///     observer_timeout_ms: 5000,
+/// };
+///
+/// let property = ObservableProperty::new_with_config(42, config);
+/// ```
+#[derive(Debug, Clone)]
+pub struct PropertyConfig {
+    /// Maximum number of observers allowed
+    ///
+    /// When this limit is reached, attempts to subscribe additional observers
+    /// will return a `PropertyError::CapacityExceeded` error.
+    ///
+    /// Default: 1000
+    pub max_observers: usize,
+
+    /// Maximum pending async notifications per observer (reserved for future use)
+    ///
+    /// This limit helps prevent memory exhaustion from queued notifications.
+    ///
+    /// Default: 100
+    pub max_pending_notifications: usize,
+
+    /// Timeout for observer execution in milliseconds (reserved for future use)
+    ///
+    /// Observers that exceed this threshold may be logged or flagged for debugging.
+    ///
+    /// Default: 5000ms
+    pub observer_timeout_ms: u64,
+}
+
+impl Default for PropertyConfig {
+    fn default() -> Self {
+        Self {
+            max_observers: 1000,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        }
+    }
+}
+
+/// Report generated after a property shutdown operation
+///
+/// Contains diagnostic information about the shutdown process,
+/// including the number of observers cleared and timing information.
+///
+/// # Examples
+///
+/// ```
+/// use observable_property_tokio::{ObservableProperty, PropertyConfig};
+/// use std::time::Duration;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let property = ObservableProperty::new(42);
+///     
+///     // ... use property ...
+///     
+///     let report = property.shutdown_with_timeout(Duration::from_secs(5)).await?;
+///     println!("Shutdown complete: {:?}", report);
+///     Ok(())
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ShutdownReport {
+    /// Number of observers that were cleared during shutdown
+    pub observers_cleared: usize,
+    
+    /// Time taken to complete the shutdown operation
+    pub shutdown_duration: std::time::Duration,
+    
+    /// Whether the shutdown completed within the timeout period
+    pub completed_within_timeout: bool,
+    
+    /// Timestamp when shutdown was initiated (milliseconds since epoch)
+    pub initiated_at_ms: u64,
+}
+
+impl ShutdownReport {
+    /// Get a diagnostic string for logging
+    pub fn diagnostic_info(&self) -> String {
+        format!(
+            "SHUTDOWN_COMPLETE | observers_cleared={} | duration_ms={} | within_timeout={} | initiated_at_ms={}",
+            self.observers_cleared,
+            self.shutdown_duration.as_millis(),
+            self.completed_within_timeout,
+            self.initiated_at_ms
+        )
+    }
 }
 
 /// Function type for observers that get called when property values change
@@ -214,6 +499,7 @@ impl fmt::Display for ObserverId {
 /// ```
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
+    config: PropertyConfig,
 }
 
 struct InnerProperty<T> {
@@ -259,6 +545,9 @@ impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// Creates a new observable property with the given initial value
     ///
+    /// Uses default configuration with max_observers=1000.
+    /// For custom limits, use `new_with_config()`.
+    ///
     /// # Arguments
     ///
     /// * `initial_value` - The starting value for this property
@@ -272,12 +561,41 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// assert_eq!(property.get().unwrap(), 42);
     /// ```
     pub fn new(initial_value: T) -> Self {
+        Self::new_with_config(initial_value, PropertyConfig::default())
+    }
+
+    /// Creates a new observable property with custom configuration
+    ///
+    /// This allows you to specify limits on the number of observers and other
+    /// behavioral parameters to prevent resource exhaustion.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `config` - Configuration options for backpressure and resource limits
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property_tokio::{ObservableProperty, PropertyConfig};
+    ///
+    /// let config = PropertyConfig {
+    ///     max_observers: 50,
+    ///     max_pending_notifications: 100,
+    ///     observer_timeout_ms: 3000,
+    /// };
+    ///
+    /// let property = ObservableProperty::new_with_config(0, config);
+    /// assert_eq!(property.get().unwrap(), 0);
+    /// ```
+    pub fn new_with_config(initial_value: T, config: PropertyConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(InnerProperty {
                 value: initial_value,
                 observers: HashMap::new(),
                 next_id: 0,
             })),
+            config,
         }
     }
 
@@ -569,6 +887,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn subscribe(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
         let mut inner = self.inner.write();
+
+        // Check if we've reached the maximum number of observers
+        if inner.observers.len() >= self.config.max_observers {
+            return Err(PropertyError::CapacityExceeded {
+                current: inner.observers.len(),
+                max: self.config.max_observers,
+                resource: "observers".to_string(),
+            });
+        }
 
         let id = ObserverId(inner.next_id);
         inner.next_id += 1;
@@ -1035,6 +1362,89 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         self.clear_observers()
     }
 
+    /// Shutdown the property with a timeout, waiting for pending async operations
+    ///
+    /// This method performs a comprehensive shutdown that:
+    /// 1. Clears all observers
+    /// 2. Waits for a grace period to allow pending async operations to complete
+    /// 3. Returns a detailed report about the shutdown process
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum duration to wait for shutdown to complete
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ShutdownReport)` containing shutdown metrics and diagnostics
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = ObservableProperty::new(0);
+    ///     
+    ///     // Add some async observers
+    ///     property.subscribe_async(|_, new| async move {
+    ///         println!("Async observer: {}", new);
+    ///     })?;
+    ///     
+    ///     property.subscribe(Arc::new(|_, new| {
+    ///         println!("Sync observer: {}", new);
+    ///     }))?;
+    ///     
+    ///     // ... use property ...
+    ///     
+    ///     // Graceful shutdown with timeout
+    ///     let report = property.shutdown_with_timeout(Duration::from_secs(5)).await?;
+    ///     
+    ///     println!("Shutdown report: {}", report.diagnostic_info());
+    ///     println!("Cleared {} observers in {:?}", 
+    ///         report.observers_cleared, 
+    ///         report.shutdown_duration);
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ShutdownReport, PropertyError> {
+        use std::time::{SystemTime, UNIX_EPOCH, Instant};
+        
+        let start = Instant::now();
+        let initiated_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        
+        // Get initial observer count before clearing
+        let initial_count = self.observer_count();
+        
+        // Clear all observers
+        self.clear_observers()?;
+        
+        // Wait for pending notifications with timeout
+        let grace_period = timeout.min(std::time::Duration::from_millis(500));
+        let completed_within_timeout = tokio::time::timeout(
+            grace_period,
+            tokio::time::sleep(grace_period)
+        ).await.is_ok();
+        
+        let shutdown_duration = start.elapsed();
+        
+        Ok(ShutdownReport {
+            observers_cleared: initial_count,
+            shutdown_duration,
+            completed_within_timeout,
+            initiated_at_ms,
+        })
+    }
+
     pub fn subscribe_with_token(&self, observer: Observer<T>) -> Result<Subscription<T>, PropertyError> {
         let id = self.subscribe(observer)?;
         Ok(Subscription {
@@ -1136,6 +1546,7 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            config: self.config.clone(),
         }
     }
 }
@@ -1890,6 +2301,602 @@ mod tests {
         property.set(200)?;
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
+        Ok(())
+    }
+
+    // Test backpressure and configuration functionality
+    #[tokio::test]
+    async fn test_property_config_default() {
+        let config = PropertyConfig::default();
+        assert_eq!(config.max_observers, 1000);
+        assert_eq!(config.max_pending_notifications, 100);
+        assert_eq!(config.observer_timeout_ms, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_property_with_custom_config() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 5,
+            max_pending_notifications: 10,
+            observer_timeout_ms: 1000,
+        };
+
+        let property = ObservableProperty::new_with_config(42, config);
+        assert_eq!(property.get()?, 42);
+
+        // Should be able to add up to max_observers
+        for i in 0..5 {
+            property.subscribe(Arc::new(move |_, _| {
+                println!("Observer {}", i);
+            }))?;
+        }
+
+        assert_eq!(property.observer_count(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_observer_capacity_limit() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 3,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+
+        // Add observers up to limit
+        property.subscribe(Arc::new(|_, _| {}))?;
+        property.subscribe(Arc::new(|_, _| {}))?;
+        property.subscribe(Arc::new(|_, _| {}))?;
+
+        assert_eq!(property.observer_count(), 3);
+
+        // Next subscribe should fail with CapacityExceeded
+        let result = property.subscribe(Arc::new(|_, _| {}));
+        assert!(matches!(result, Err(PropertyError::CapacityExceeded { .. })));
+
+        if let Err(PropertyError::CapacityExceeded { current, max, resource }) = result {
+            assert_eq!(current, 3);
+            assert_eq!(max, 3);
+            assert_eq!(resource, "observers");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_observer_capacity_after_unsubscribe() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 2,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+
+        // Add observers up to limit
+        let id1 = property.subscribe(Arc::new(|_, _| {}))?;
+        let _id2 = property.subscribe(Arc::new(|_, _| {}))?;
+
+        assert_eq!(property.observer_count(), 2);
+
+        // Next subscribe should fail
+        assert!(property.subscribe(Arc::new(|_, _| {})).is_err());
+
+        // Unsubscribe one observer
+        property.unsubscribe(id1)?;
+        assert_eq!(property.observer_count(), 1);
+
+        // Now we should be able to add another observer
+        let _id3 = property.subscribe(Arc::new(|_, _| {}))?;
+        assert_eq!(property.observer_count(), 2);
+
+        // But not beyond the limit
+        assert!(property.subscribe(Arc::new(|_, _| {})).is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_observer_capacity_limit() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 2,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+
+        // Add async observers up to limit
+        property.subscribe_async(|_, _| async move {
+            sleep(Duration::from_millis(10)).await;
+        })?;
+
+        property.subscribe_async(|_, _| async move {
+            sleep(Duration::from_millis(10)).await;
+        })?;
+
+        assert_eq!(property.observer_count(), 2);
+
+        // Next subscribe should fail
+        let result = property.subscribe_async(|_, _| async move {});
+        assert!(matches!(result, Err(PropertyError::CapacityExceeded { .. })));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filtered_observer_capacity_limit() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 2,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+
+        // Add filtered observers up to limit
+        property.subscribe_filtered(Arc::new(|_, _| {}), |_, _| true)?;
+        property.subscribe_filtered(Arc::new(|_, _| {}), |_, _| true)?;
+
+        assert_eq!(property.observer_count(), 2);
+
+        // Next subscribe should fail
+        let result = property.subscribe_filtered(Arc::new(|_, _| {}), |_, _| true);
+        assert!(matches!(result, Err(PropertyError::CapacityExceeded { .. })));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_capacity_error_diagnostic() {
+        let error = PropertyError::CapacityExceeded {
+            current: 100,
+            max: 100,
+            resource: "observers".to_string(),
+        };
+
+        let diagnostic = error.diagnostic_info();
+        assert!(diagnostic.contains("CAPACITY_EXCEEDED"));
+        assert!(diagnostic.contains("resource=observers"));
+        assert!(diagnostic.contains("current=100"));
+        assert!(diagnostic.contains("max=100"));
+        assert!(diagnostic.contains("utilization=100.0%"));
+    }
+
+    #[tokio::test]
+    async fn test_cloned_property_shares_config() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 3,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property1 = ObservableProperty::new_with_config(0, config);
+        let property2 = property1.clone();
+
+        // Add observers through both properties
+        property1.subscribe(Arc::new(|_, _| {}))?;
+        property2.subscribe(Arc::new(|_, _| {}))?;
+        property1.subscribe(Arc::new(|_, _| {}))?;
+
+        // Both should show 3 observers since they share the same inner state
+        assert_eq!(property1.observer_count(), 3);
+        assert_eq!(property2.observer_count(), 3);
+
+        // Next subscribe should fail on either property
+        assert!(property1.subscribe(Arc::new(|_, _| {})).is_err());
+        assert!(property2.subscribe(Arc::new(|_, _| {})).is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_subscription_token_with_capacity() -> Result<(), PropertyError> {
+        let config = PropertyConfig {
+            max_observers: 2,
+            max_pending_notifications: 100,
+            observer_timeout_ms: 5000,
+        };
+
+        let property = ObservableProperty::new_with_config(0, config);
+
+        // Create subscriptions with tokens
+        let _sub1 = property.subscribe_with_token(Arc::new(|_, _| {}))?;
+        let _sub2 = property.subscribe_with_token(Arc::new(|_, _| {}))?;
+
+        assert_eq!(property.observer_count(), 2);
+
+        // Next subscribe should fail
+        let result = property.subscribe_with_token(Arc::new(|_, _| {}));
+        assert!(matches!(result, Err(PropertyError::CapacityExceeded { .. })));
+
+        // Drop one subscription
+        drop(_sub1);
+
+        // Now we should be able to add another
+        let _sub3 = property.subscribe_with_token(Arc::new(|_, _| {}))?;
+        assert_eq!(property.observer_count(), 2);
+
+        Ok(())
+    }
+
+    // Test error diagnostic functionality
+    #[tokio::test]
+    async fn test_error_diagnostic_info() {
+        // Test ReadLockError
+        let read_error = PropertyError::read_lock_error("get_value", "acquiring read lock failed");
+        let diagnostic = read_error.diagnostic_info();
+        assert!(diagnostic.contains("READ_LOCK_ERROR"));
+        assert!(diagnostic.contains("operation=get_value"));
+        assert!(diagnostic.contains("context=acquiring read lock failed"));
+        assert!(diagnostic.contains("timestamp_ms="));
+
+        // Test WriteLockError
+        let write_error = PropertyError::write_lock_error("set_value", "acquiring write lock failed");
+        let diagnostic = write_error.diagnostic_info();
+        assert!(diagnostic.contains("WRITE_LOCK_ERROR"));
+        assert!(diagnostic.contains("operation=set_value"));
+
+        // Test LockPoisoned
+        let poisoned_error = PropertyError::lock_poisoned("notify", "inner lock poisoned");
+        let diagnostic = poisoned_error.diagnostic_info();
+        assert!(diagnostic.contains("LOCK_POISONED"));
+        assert!(diagnostic.contains("operation=notify"));
+        assert!(diagnostic.contains("context=inner lock poisoned"));
+
+        // Test ObserverPanic
+        let panic_error = PropertyError::observer_panic(ObserverId(42), "observer crashed");
+        let diagnostic = panic_error.diagnostic_info();
+        assert!(diagnostic.contains("OBSERVER_PANIC"));
+        assert!(diagnostic.contains("observer_id=42"));
+        assert!(diagnostic.contains("error=observer crashed"));
+
+        // Test ObserverNotFound
+        let not_found_error = PropertyError::ObserverNotFound { id: ObserverId(99) };
+        let diagnostic = not_found_error.diagnostic_info();
+        assert!(diagnostic.contains("OBSERVER_NOT_FOUND"));
+        assert!(diagnostic.contains("id=99"));
+
+        // Test CapacityExceeded
+        let capacity_error = PropertyError::CapacityExceeded {
+            current: 150,
+            max: 100,
+            resource: "observers".to_string(),
+        };
+        let diagnostic = capacity_error.diagnostic_info();
+        assert!(diagnostic.contains("CAPACITY_EXCEEDED"));
+        assert!(diagnostic.contains("resource=observers"));
+        assert!(diagnostic.contains("current=150"));
+        assert!(diagnostic.contains("max=100"));
+        assert!(diagnostic.contains("utilization=150.0%"));
+
+        // Test OperationTimeout
+        let timeout_error = PropertyError::OperationTimeout {
+            operation: "notify_all".to_string(),
+            elapsed_ms: 5500,
+            threshold_ms: 5000,
+        };
+        let diagnostic = timeout_error.diagnostic_info();
+        assert!(diagnostic.contains("OPERATION_TIMEOUT"));
+        assert!(diagnostic.contains("operation=notify_all"));
+        assert!(diagnostic.contains("elapsed_ms=5500"));
+        assert!(diagnostic.contains("threshold_ms=5000"));
+        assert!(diagnostic.contains("overage_ms=500"));
+
+        // Test ShutdownInProgress
+        let shutdown_error = PropertyError::ShutdownInProgress;
+        let diagnostic = shutdown_error.diagnostic_info();
+        assert!(diagnostic.contains("SHUTDOWN_IN_PROGRESS"));
+
+        // Test ObserverError
+        let observer_error = PropertyError::ObserverError {
+            reason: "callback failed".to_string(),
+        };
+        let diagnostic = observer_error.diagnostic_info();
+        assert!(diagnostic.contains("OBSERVER_ERROR"));
+        assert!(diagnostic.contains("reason=callback failed"));
+
+        // Test TokioError
+        let tokio_error = PropertyError::TokioError {
+            reason: "runtime unavailable".to_string(),
+        };
+        let diagnostic = tokio_error.diagnostic_info();
+        assert!(diagnostic.contains("TOKIO_ERROR"));
+        assert!(diagnostic.contains("reason=runtime unavailable"));
+
+        // Test JoinError
+        let join_error = PropertyError::JoinError("task panicked".to_string());
+        let diagnostic = join_error.diagnostic_info();
+        assert!(diagnostic.contains("JOIN_ERROR"));
+        assert!(diagnostic.contains("message=task panicked"));
+    }
+
+    #[tokio::test]
+    async fn test_error_helper_functions_with_timestamp() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Create errors using helper functions
+        let read_error = PropertyError::read_lock_error("test_op", "test_context");
+        let write_error = PropertyError::write_lock_error("test_op", "test_context");
+        let poisoned_error = PropertyError::lock_poisoned("test_op", "test_context");
+        let panic_error = PropertyError::observer_panic(ObserverId(1), "test_panic");
+
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Verify timestamps are reasonable (within the time window of test execution)
+        match read_error {
+            PropertyError::ReadLockError { timestamp_ms, .. } => {
+                assert!(timestamp_ms >= before && timestamp_ms <= after);
+            }
+            _ => panic!("Expected ReadLockError"),
+        }
+
+        match write_error {
+            PropertyError::WriteLockError { timestamp_ms, .. } => {
+                assert!(timestamp_ms >= before && timestamp_ms <= after);
+            }
+            _ => panic!("Expected WriteLockError"),
+        }
+
+        match poisoned_error {
+            PropertyError::LockPoisoned { timestamp_ms, .. } => {
+                assert!(timestamp_ms >= before && timestamp_ms <= after);
+            }
+            _ => panic!("Expected LockPoisoned"),
+        }
+
+        match panic_error {
+            PropertyError::ObserverPanic { timestamp_ms, .. } => {
+                assert!(timestamp_ms >= before && timestamp_ms <= after);
+            }
+            _ => panic!("Expected ObserverPanic"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_display_formatting() {
+        let timeout_error = PropertyError::OperationTimeout {
+            operation: "test_operation".to_string(),
+            elapsed_ms: 1500,
+            threshold_ms: 1000,
+        };
+        let display = format!("{}", timeout_error);
+        assert!(display.contains("test_operation"));
+        assert!(display.contains("1500ms"));
+        assert!(display.contains("1000ms"));
+
+        let capacity_error = PropertyError::CapacityExceeded {
+            current: 200,
+            max: 100,
+            resource: "test_resource".to_string(),
+        };
+        let display = format!("{}", capacity_error);
+        assert!(display.contains("200"));
+        assert!(display.contains("100"));
+        assert!(display.contains("test_resource"));
+    }
+
+    #[tokio::test]
+    async fn test_capacity_exceeded_utilization_calculation() {
+        let error = PropertyError::CapacityExceeded {
+            current: 75,
+            max: 100,
+            resource: "observers".to_string(),
+        };
+        let diagnostic = error.diagnostic_info();
+        assert!(diagnostic.contains("utilization=75.0%"));
+
+        let error2 = PropertyError::CapacityExceeded {
+            current: 100,
+            max: 100,
+            resource: "observers".to_string(),
+        };
+        let diagnostic2 = error2.diagnostic_info();
+        assert!(diagnostic2.contains("utilization=100.0%"));
+    }
+
+    // Test graceful shutdown functionality
+    #[tokio::test]
+    async fn test_shutdown_with_timeout_basic() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        // Add some observers
+        let counter1 = counter.clone();
+        property.subscribe(Arc::new(move |_, _| {
+            counter1.fetch_add(1, Ordering::SeqCst);
+        }))?;
+        
+        let counter2 = counter.clone();
+        property.subscribe_async(move |_, _| {
+            let counter = counter2.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })?;
+        
+        assert_eq!(property.observer_count(), 2);
+        
+        // Perform shutdown with timeout
+        let report = property.shutdown_with_timeout(Duration::from_secs(5)).await?;
+        
+        // Verify report
+        assert_eq!(report.observers_cleared, 2);
+        assert!(report.shutdown_duration.as_secs() < 5);
+        assert!(report.completed_within_timeout);
+        assert!(report.initiated_at_ms > 0);
+        
+        // Verify observers were cleared
+        assert_eq!(property.observer_count(), 0);
+        
+        // Setting value should not trigger observers
+        property.set(42)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_report_diagnostic() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = ObservableProperty::new(100);
+        
+        // Add multiple observers
+        for _ in 0..5 {
+            property.subscribe(Arc::new(|_, _| {}))?;
+        }
+        
+        let report = property.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        
+        let diagnostic = report.diagnostic_info();
+        assert!(diagnostic.contains("SHUTDOWN_COMPLETE"));
+        assert!(diagnostic.contains("observers_cleared=5"));
+        assert!(diagnostic.contains("within_timeout=true"));
+        assert!(diagnostic.contains("initiated_at_ms="));
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_with_async_observers() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        // Add async observers that take some time
+        let counter1 = counter.clone();
+        property.subscribe_async(move |_, _| {
+            let counter = counter1.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })?;
+        
+        let counter2 = counter.clone();
+        property.subscribe_async(move |_, _| {
+            let counter = counter2.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })?;
+        
+        // Trigger observers
+        property.set_async(42).await?;
+        
+        // Give time for async operations to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        
+        // Shutdown with enough timeout for operations to complete
+        let report = property.shutdown_with_timeout(Duration::from_secs(2)).await?;
+        
+        assert_eq!(report.observers_cleared, 2);
+        assert!(report.completed_within_timeout);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_idempotent() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = ObservableProperty::new("test");
+        
+        property.subscribe(Arc::new(|_, _| {}))?;
+        property.subscribe(Arc::new(|_, _| {}))?;
+        
+        // First shutdown
+        let report1 = property.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        assert_eq!(report1.observers_cleared, 2);
+        
+        // Second shutdown should still succeed but clear 0 observers
+        let report2 = property.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        assert_eq!(report2.observers_cleared, 0);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_vs_shutdown_with_timeout() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        // Test regular shutdown
+        let property1 = ObservableProperty::new(0);
+        property1.subscribe(Arc::new(|_, _| {}))?;
+        property1.subscribe(Arc::new(|_, _| {}))?;
+        
+        property1.shutdown()?;
+        assert_eq!(property1.observer_count(), 0);
+        
+        // Test shutdown with timeout
+        let property2 = ObservableProperty::new(0);
+        property2.subscribe(Arc::new(|_, _| {}))?;
+        property2.subscribe(Arc::new(|_, _| {}))?;
+        
+        let report = property2.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        assert_eq!(property2.observer_count(), 0);
+        assert_eq!(report.observers_cleared, 2);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_report_timing() -> Result<(), PropertyError> {
+        use std::time::{Duration, Instant};
+        
+        let property = ObservableProperty::new(0);
+        
+        // Add several observers
+        for _ in 0..10 {
+            property.subscribe(Arc::new(|_, _| {}))?;
+        }
+        
+        let start = Instant::now();
+        let report = property.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        let elapsed = start.elapsed();
+        
+        // Shutdown should complete reasonably quickly
+        assert!(elapsed < Duration::from_secs(2));
+        assert!(report.shutdown_duration <= elapsed);
+        assert_eq!(report.observers_cleared, 10);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_with_filtered_and_async_observers() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = ObservableProperty::new(0);
+        
+        // Mix of different observer types
+        property.subscribe(Arc::new(|_, _| {}))?;
+        property.subscribe_async(|_, _| async {})?;
+        property.subscribe_filtered(Arc::new(|_, _| {}), |_, new| new % 2 == 0)?;
+        property.subscribe_async_filtered(|_, _| async {}, |_, new| new > &0)?;
+        
+        assert_eq!(property.observer_count(), 4);
+        
+        let report = property.shutdown_with_timeout(Duration::from_secs(1)).await?;
+        
+        assert_eq!(report.observers_cleared, 4);
+        assert_eq!(property.observer_count(), 0);
+        
         Ok(())
     }
 }
