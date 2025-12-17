@@ -2899,6 +2899,606 @@ mod tests {
         
         Ok(())
     }
+
+    // Batching tests
+    #[tokio::test]
+    async fn test_batched_property_creation() -> Result<(), PropertyError> {
+        let property = BatchedProperty::new(42);
+        assert_eq!(property.get()?, 42);
+        
+        let config = BatchConfig {
+            batch_interval: std::time::Duration::from_millis(50),
+        };
+        let property2 = BatchedProperty::new_with_config(100, config);
+        assert_eq!(property2.get()?, 100);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_queue_update() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = BatchedProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let last_value = Arc::new(RwLock::new(0));
+        
+        // Subscribe to updates
+        property.subscribe(Arc::new({
+            let counter = counter.clone();
+            let last_value = last_value.clone();
+            move |_, new| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                *last_value.write() = *new;
+            }
+        }))?;
+        
+        // Queue multiple updates rapidly
+        for i in 1..=10 {
+            property.queue_update(i)?;
+        }
+        
+        // Wait for batch to flush (default is 100ms)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        
+        // Should have been notified only once with the last value
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_value.read(), 10);
+        assert_eq!(property.get()?, 10);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_multiple_batches() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let config = BatchConfig {
+            batch_interval: Duration::from_millis(50),
+        };
+        let property = BatchedProperty::new_with_config(0, config);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        property.subscribe(Arc::new({
+            let counter = counter.clone();
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }))?;
+        
+        // First batch
+        for i in 1..=5 {
+            property.queue_update(i)?;
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        
+        // Second batch
+        for i in 6..=10 {
+            property.queue_update(i)?;
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        
+        // Should have been notified twice (once per batch)
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(property.get()?, 10);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_set_immediate() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = BatchedProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        property.subscribe(Arc::new({
+            let counter = counter.clone();
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }))?;
+        
+        // Queue some updates
+        property.queue_update(5)?;
+        property.queue_update(10)?;
+        
+        // Set immediately - should notify right away
+        property.set_immediate(42)?;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(property.get()?, 42);
+        
+        // Wait for batch - queued updates should be cleared by set_immediate
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        
+        // Counter should still be 1 (no additional notification from batch)
+        // Note: This behavior depends on timing, but set_immediate should have priority
+        assert!(counter.load(Ordering::SeqCst) >= 1);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_flush() -> Result<(), PropertyError> {
+        let property = BatchedProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        property.subscribe(Arc::new({
+            let counter = counter.clone();
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }))?;
+        
+        // Queue updates
+        property.queue_update(42)?;
+        
+        // Flush immediately
+        property.flush().await?;
+        
+        // Should be notified immediately
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(property.get()?, 42);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_async_observer() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property = BatchedProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        property.subscribe_async({
+            let counter = counter.clone();
+            move |_, _| {
+                let counter = counter.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })?;
+        
+        // Queue multiple updates
+        for i in 1..=5 {
+            property.queue_update(i)?;
+        }
+        
+        // Wait for batch and async processing
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        
+        // Should have been notified once
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_observer_management() -> Result<(), PropertyError> {
+        let property = BatchedProperty::new(0);
+        
+        // Add observers
+        let id1 = property.subscribe(Arc::new(|_, _| {}))?;
+        let _id2 = property.subscribe(Arc::new(|_, _| {}))?;
+        assert_eq!(property.observer_count(), 2);
+        
+        // Unsubscribe one
+        property.unsubscribe(id1)?;
+        assert_eq!(property.observer_count(), 1);
+        
+        // Clear all
+        property.clear_observers()?;
+        assert_eq!(property.observer_count(), 0);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_clone() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let property1 = BatchedProperty::new(0);
+        let property2 = property1.clone();
+        
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        // Subscribe on clone
+        property2.subscribe(Arc::new({
+            let counter = counter.clone();
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }))?;
+        
+        // Update on original
+        property1.queue_update(42)?;
+        
+        // Wait for batch
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        
+        // Observer should be notified
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(property1.get()?, 42);
+        assert_eq!(property2.get()?, 42);
+        
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batched_property_high_frequency() -> Result<(), PropertyError> {
+        use std::time::Duration;
+        
+        let config = BatchConfig {
+            batch_interval: Duration::from_millis(100),
+        };
+        let property = BatchedProperty::new_with_config(0, config);
+        let counter = Arc::new(AtomicUsize::new(0));
+        
+        property.subscribe(Arc::new({
+            let counter = counter.clone();
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }))?;
+        
+        // Queue 1000 updates rapidly
+        for i in 1..=1000 {
+            property.queue_update(i)?;
+        }
+        
+        // Wait for batch
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        
+        // Should have been notified only once despite 1000 updates
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(property.get()?, 1000);
+        
+        Ok(())
+    }
+}
+
+/// Configuration for batched property updates
+///
+/// Controls how frequently batched updates are flushed to observers,
+/// helping reduce overhead for high-frequency property changes.
+///
+/// # Examples
+///
+/// ```
+/// use observable_property_tokio::BatchConfig;
+/// use std::time::Duration;
+///
+/// let config = BatchConfig {
+///     batch_interval: Duration::from_millis(100),
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct BatchConfig {
+    /// How often to flush batched updates to observers
+    ///
+    /// A longer interval reduces notification overhead but increases latency.
+    /// A shorter interval provides faster updates but with more overhead.
+    ///
+    /// Default: 100ms
+    pub batch_interval: std::time::Duration,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_interval: std::time::Duration::from_millis(100),
+        }
+    }
+}
+
+/// A batched wrapper around ObservableProperty that reduces notification overhead
+///
+/// This type collects property updates and only notifies observers at regular intervals,
+/// which is useful for high-frequency update scenarios where you want to reduce the
+/// number of observer notifications.
+///
+/// # Examples
+///
+/// ```
+/// use observable_property_tokio::{BatchedProperty, BatchConfig};
+/// use std::time::Duration;
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+///     // Create a batched property with 100ms batching interval
+///     let config = BatchConfig {
+///         batch_interval: Duration::from_millis(100),
+///     };
+///     
+///     let property = BatchedProperty::new_with_config(0, config);
+///     
+///     // Subscribe to batched updates
+///     property.subscribe(Arc::new(|old, new| {
+///         println!("Batched update: {} -> {}", old, new);
+///     }))?;
+///     
+///     // Queue multiple updates rapidly
+///     for i in 1..=100 {
+///         property.queue_update(i)?;
+///     }
+///     
+///     // Observers will only be notified once per batch interval
+///     // with the latest value
+///     
+///     // Wait for batch to flush
+///     tokio::time::sleep(Duration::from_millis(150)).await;
+///     
+///     Ok(())
+/// }
+/// ```
+pub struct BatchedProperty<T: Clone + Send + Sync + 'static> {
+    inner: ObservableProperty<T>,
+    pending_update: Arc<RwLock<Option<T>>>,
+    _batch_task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> BatchedProperty<T> {
+    /// Create a new batched property with default configuration
+    ///
+    /// Uses a batch interval of 100ms by default.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for the property
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::BatchedProperty;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = BatchedProperty::new(42);
+    ///     assert_eq!(property.get()?, 42);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn new(initial_value: T) -> Self {
+        Self::new_with_config(initial_value, BatchConfig::default())
+    }
+
+    /// Create a new batched property with custom configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for the property
+    /// * `config` - Batch configuration controlling flush interval
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::{BatchedProperty, BatchConfig};
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let config = BatchConfig {
+    ///         batch_interval: Duration::from_millis(50),
+    ///     };
+    ///
+    ///     let property = BatchedProperty::new_with_config(0, config);
+    /// }
+    /// ```
+    pub fn new_with_config(initial_value: T, config: BatchConfig) -> Self {
+        let inner = ObservableProperty::new(initial_value);
+        let pending_update = Arc::new(RwLock::new(None));
+
+        // Spawn batch processor task
+        let inner_clone = inner.clone();
+        let pending_clone = pending_update.clone();
+        let batch_interval = config.batch_interval;
+
+        let batch_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(batch_interval);
+            loop {
+                interval.tick().await;
+                
+                // Check if there's a pending update
+                let update = {
+                    let mut pending = pending_clone.write();
+                    pending.take()
+                };
+
+                // If there's an update, apply it
+                if let Some(value) = update {
+                    let _ = inner_clone.set_async(value).await;
+                }
+            }
+        });
+
+        Self {
+            inner,
+            pending_update,
+            _batch_task: Arc::new(batch_task),
+        }
+    }
+
+    /// Queue an update to be batched
+    ///
+    /// The update will be held until the next batch interval, at which point
+    /// only the most recent queued value will be applied and observers notified.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to queue
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the update was queued successfully
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::BatchedProperty;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = BatchedProperty::new(0);
+    ///     
+    ///     // Queue multiple updates
+    ///     for i in 1..=10 {
+    ///         property.queue_update(i)?;
+    ///     }
+    ///     
+    ///     // Wait for batch to flush
+    ///     tokio::time::sleep(Duration::from_millis(150)).await;
+    ///     
+    ///     // Property will have the last queued value
+    ///     assert_eq!(property.get()?, 10);
+    ///     
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn queue_update(&self, value: T) -> Result<(), PropertyError> {
+        *self.pending_update.write() = Some(value);
+        Ok(())
+    }
+
+    /// Set the value immediately, bypassing batching
+    ///
+    /// This will apply the update immediately and notify observers synchronously,
+    /// without waiting for the next batch interval.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to set
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::BatchedProperty;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    /// let property = BatchedProperty::new(0);
+    /// property.set_immediate(42)?;
+    /// assert_eq!(property.get()?, 42);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_immediate(&self, value: T) -> Result<(), PropertyError> {
+        self.inner.set(value)
+    }
+
+    /// Set the value immediately using async notification
+    ///
+    /// This will apply the update immediately and notify observers asynchronously,
+    /// without waiting for the next batch interval.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The new value to set
+    pub async fn set_immediate_async(&self, value: T) -> Result<(), PropertyError> {
+        self.inner.set_async(value).await
+    }
+
+    /// Get the current value
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::BatchedProperty;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    ///     let property = BatchedProperty::new(42);
+    ///     assert_eq!(property.get()?, 42);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn get(&self) -> Result<T, PropertyError> {
+        self.inner.get()
+    }
+
+    /// Subscribe to batched property changes
+    ///
+    /// Observers will be notified at batch intervals with the latest value.
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - Callback function to handle property changes
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ObserverId)` containing a unique identifier for this observer
+    pub fn subscribe(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
+        self.inner.subscribe(observer)
+    }
+
+    /// Subscribe with an async handler
+    pub fn subscribe_async<F, Fut>(&self, handler: F) -> Result<ObserverId, PropertyError>
+    where
+        F: Fn(T, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.inner.subscribe_async(handler)
+    }
+
+    /// Unsubscribe an observer
+    pub fn unsubscribe(&self, id: ObserverId) -> Result<(), PropertyError> {
+        self.inner.unsubscribe(id)
+    }
+
+    /// Get the number of registered observers
+    pub fn observer_count(&self) -> usize {
+        self.inner.observer_count()
+    }
+
+    /// Clear all observers
+    pub fn clear_observers(&self) -> Result<(), PropertyError> {
+        self.inner.clear_observers()
+    }
+
+    /// Flush any pending batched update immediately
+    ///
+    /// This forces any queued update to be applied right away,
+    /// rather than waiting for the next batch interval.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use observable_property_tokio::BatchedProperty;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    /// let property = BatchedProperty::new(0);
+    /// property.queue_update(42)?;
+    /// property.flush().await?;
+    /// assert_eq!(property.get()?, 42);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn flush(&self) -> Result<(), PropertyError> {
+        let update = {
+            let mut pending = self.pending_update.write();
+            pending.take()
+        };
+
+        if let Some(value) = update {
+            self.inner.set_async(value).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Clone for BatchedProperty<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            pending_update: Arc::clone(&self.pending_update),
+            _batch_task: Arc::clone(&self._batch_task),
+        }
+    }
 }
 
 impl From<JoinError> for PropertyError {

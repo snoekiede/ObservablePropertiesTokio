@@ -28,6 +28,7 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Observer pattern**: Subscribe to property changes with callbacks
 - **Filtered observers**: Only notify when specific conditions are met
 - **Async notifications**: Non-blocking observer notifications with Tokio tasks
+- **Batching**: Reduce overhead for high-frequency updates with configurable intervals
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
 - **Proper error handling**: All operations return `Result` types instead of panicking
@@ -308,6 +309,7 @@ The crate includes several examples demonstrating different usage patterns:
 - [`filtered_observers.rs`](examples/filtered_observers.rs) - Conditional observers
 - [`async_observers.rs`](examples/async_observers.rs) - Asynchronous observer handlers
 - [`multi_threading.rs`](examples/multi_threading.rs) - Concurrent access patterns
+- [`batching.rs`](examples/batching.rs) - Batching for high-frequency updates with 10 scenarios
 - [`backpressure.rs`](examples/backpressure.rs) - Backpressure and rate limiting with configurable limits
 - [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) - Graceful shutdown with timeout and diagnostics
 - [`subscription_token.rs`](examples/subscription_token.rs) - RAII-style automatic subscription cleanup
@@ -320,6 +322,8 @@ Run examples with:
 
 ```bash
 cargo run --example basic_usage
+cargo run --example batching
+cargo run --example backpressure
 cargo run --example graceful_shutdown
 cargo run --example subscription_token
 cargo run --example property_mapping
@@ -332,7 +336,9 @@ cargo run --example error_diagnostics
 ### Core Types
 
 - `ObservableProperty<T>` - The main observable property type
+- `BatchedProperty<T>` - Batched wrapper for reducing high-frequency update overhead
 - `PropertyConfig` - Configuration for backpressure and resource limits
+- `BatchConfig` - Configuration for batching intervals
 - `ShutdownReport` - Diagnostic report from graceful shutdown operations
 - `PropertyError` - Error type returned by all operations with diagnostic capabilities
 - `Observer<T>` - Type alias for observer functions: `Arc<dyn Fn(&T, &T) + Send + Sync>`
@@ -414,6 +420,144 @@ The `ShutdownReport` struct provides comprehensive shutdown metrics:
   - Compliance/audit requirements
 
 See the [`graceful_shutdown.rs`](examples/graceful_shutdown.rs) example for comprehensive demonstrations.
+
+## ⚡ Batching for High-Frequency Updates
+
+### Overview
+
+The `BatchedProperty` type reduces overhead for high-frequency property updates by batching notifications to observers. Instead of notifying observers for every single update, changes are collected and observers are notified only at regular intervals with the latest value.
+
+### Benefits
+
+- **Reduced CPU usage**: Fewer observer callbacks and task spawns
+- **Lower memory pressure**: Minimizes allocations from frequent notifications
+- **Improved throughput**: Queue operations are significantly faster than immediate notifications
+- **Maintains latest state**: Only the most recent value is notified per batch
+
+### Basic Usage
+
+```rust
+use observable_property_tokio::{BatchedProperty, BatchConfig};
+use std::time::Duration;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), observable_property_tokio::PropertyError> {
+    // Create a batched property with default 100ms interval
+    let property = BatchedProperty::new(0);
+    
+    // Or use custom configuration
+    let config = BatchConfig {
+        batch_interval: Duration::from_millis(50),
+    };
+    let property = BatchedProperty::new_with_config(0, config);
+    
+    // Subscribe to batched updates
+    property.subscribe(Arc::new(|old, new| {
+        println!("Batched update: {} -> {}", old, new);
+    }))?;
+    
+    // Queue multiple updates rapidly
+    for i in 1..=100 {
+        property.queue_update(i)?;
+    }
+    
+    // Observers will be notified once per batch interval
+    // with the latest value (100 in this case)
+    
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    
+    Ok(())
+}
+```
+
+### Batch Configuration Strategies
+
+**Low-latency (50ms)**:
+- Best for: Interactive UI updates
+- Trade-off: More notifications, lower latency
+
+**Balanced (100ms - default)**:
+- Best for: Most applications
+- Trade-off: Good balance of latency and efficiency
+
+**High-throughput (200ms)**:
+- Best for: Background data processing
+- Trade-off: Fewer notifications, higher latency
+
+**Aggressive batching (500ms+)**:
+- Best for: Analytics, logging, non-critical updates
+- Trade-off: Minimal notifications, significant latency
+
+### Bypassing Batching
+
+When you need immediate updates, bypass batching:
+
+```rust
+// Queue for batching (default behavior)
+property.queue_update(value)?;
+
+// Set immediately, bypassing batching
+property.set_immediate(critical_value)?;
+
+// Or with async notification
+property.set_immediate_async(critical_value).await?;
+
+// Manual flush of pending updates
+property.flush().await?;
+```
+
+### Performance Comparison
+
+From the [`batching.rs`](examples/batching.rs) example:
+
+```
+Unbatched: 1000 updates
+  - Time: ~280µs
+  - Notifications: 1000
+
+Batched: 1000 updates  
+  - Time: ~30µs
+  - Notifications: 1
+  - Queue speedup: ~9x faster
+  - Notification reduction: 1000x
+```
+
+### Use Cases
+
+**Real-time dashboards**:
+- Metrics updating at high frequency
+- Reduce notification overhead while maintaining current state
+
+**Sensor data**:
+- Handle hundreds of readings per second
+- Only notify with latest value at intervals
+
+**Game state**:
+- Player position, health, score updates
+- Batch rapid changes during gameplay
+
+**Analytics/logging**:
+- High-frequency event tracking
+- Reduce processing overhead
+
+### API Reference
+
+**BatchedProperty Methods**:
+- `new(value)` - Create with default 100ms interval
+- `new_with_config(value, config)` - Custom configuration
+- `queue_update(value)` - Queue for batching
+- `set_immediate(value)` - Bypass batching (sync)
+- `set_immediate_async(value)` - Bypass batching (async)
+- `flush()` - Force immediate flush of pending updates
+- `get()` - Get current value
+- `subscribe()` / `subscribe_async()` - Add observers
+- `unsubscribe()` / `clear_observers()` - Remove observers
+
+**BatchConfig**:
+- `batch_interval: Duration` - How often to flush batched updates (default: 100ms)
+
+See the comprehensive [`batching.rs`](examples/batching.rs) example for 10 different scenarios and use cases.
 
 ## 🚦 Backpressure and Resource Management
 
