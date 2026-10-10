@@ -14,7 +14,9 @@ A thread-safe, async-compatible observable property implementation for Rust that
 - Test the crate with your workload before adopting it in production; this project does not provide a production-readiness guarantee.
 - `set()` dispatches async observers as detached Tokio tasks. Use `set_async()` or `update_async()` when the caller must wait for async observer completion or receive task join errors.
 - Notifications are enqueued in value-commit order and dispatched FIFO, so mapped values cannot be overwritten by an older notification. If another caller is already dispatching, a synchronous `set()` or `update()` queues its notification and can return before observers receive it.
-- `set_async()` and `update_async()` run async observers for one update concurrently, while async observer batches from separate updates run in FIFO order. The async methods wait for their update's async observers. Synchronous observers run on the dispatcher task.
+- Async observer batches are started in FIFO order, but batches run concurrently and can complete out of order. Observers within a batch also run concurrently. This allows an async observer to await a nested update to the same property.
+- Each property has a limit of 256 queued or running notifications. `set()`, `update()`, `set_async()`, and `update_async()` return `PropertyError::Backpressure` without committing the update when the limit is reached; callers can retry after outstanding notifications finish. Mapped values still update under pressure, but their async observer notifications may be rejected and logged.
+- `set_async()` and `update_async()` wait for their update's async observers. Synchronous observers run on the dispatcher task.
 - `update()` and `update_async()` run the update closure under the property's write lock to make updates atomic. Do not call back into the same property from that closure.
 - `clear_observers()` and `shutdown()` remove registered observers but do not cancel async observer work that has already been queued or started.
 - Each async observer runs in its own Tokio task; high update rates or large observer counts can add task scheduling and cloning overhead. Synchronous setters need to be called in a Tokio runtime to dispatch async observers.
@@ -42,8 +44,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property-tokio = "0.3.0"
-tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "time"] }
+observable-property-tokio = "0.4.0"
+tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 ```
 
 ## 🔧 Quick Start

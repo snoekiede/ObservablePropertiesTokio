@@ -78,6 +78,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::{JoinError, JoinSet};
 
+const MAX_IN_FLIGHT_NOTIFICATIONS: usize = 256;
+
 /// Errors that can occur when working with ObservableProperty
 #[derive(Error, Debug, Clone)]
 pub enum PropertyError {
@@ -123,6 +125,10 @@ pub enum PropertyError {
     /// A task join error occurred
     #[error("Task join error: {0}")]
     JoinError(String),
+
+    /// Notification capacity is full; retry after outstanding notifications complete
+    #[error("Notification capacity is full ({capacity} in-flight notifications)")]
+    Backpressure { capacity: usize },
 }
 
 /// Function type for observers that get called when property values change
@@ -134,6 +140,7 @@ struct AsyncNotification {
     futures: Vec<AsyncFuture>,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     error: Option<String>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
@@ -239,7 +246,8 @@ struct InnerProperty<T> {
     next_id: usize,
     pending_notifications: VecDeque<Notification<T>>,
     notifying: bool,
-    async_sender: Option<tokio::sync::mpsc::UnboundedSender<AsyncNotification>>,
+    async_sender: Option<tokio::sync::mpsc::Sender<AsyncNotification>>,
+    notification_slots: Arc<tokio::sync::Semaphore>,
 }
 
 struct Notification<T> {
@@ -248,6 +256,20 @@ struct Notification<T> {
     observers: Vec<ObserverCallback<T>>,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     runtime: Option<tokio::runtime::Handle>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+fn try_notification_permit<T>(
+    inner: &Arc<RwLock<InnerProperty<T>>>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, PropertyError> {
+    inner
+        .read()
+        .notification_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| PropertyError::Backpressure {
+            capacity: MAX_IN_FLIGHT_NOTIFICATIONS,
+        })
 }
 
 fn replace_value<T, F>(
@@ -255,6 +277,7 @@ fn replace_value<T, F>(
     update_fn: F,
     completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     runtime: Option<tokio::runtime::Handle>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> bool
 where
     T: Clone,
@@ -271,6 +294,7 @@ where
         observers,
         completion,
         runtime,
+        permit,
     });
 
     if inner.notifying {
@@ -308,6 +332,7 @@ fn dispatch_notification<T: Clone>(
         observers,
         completion,
         runtime,
+        permit,
     } = notification;
     let mut async_futures = Vec::new();
     let mut async_error = None;
@@ -344,6 +369,24 @@ fn dispatch_notification<T: Clone>(
         return;
     }
 
+    let permit = match permit {
+        Some(permit) => Some(permit),
+        None => match inner.read().notification_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let error = format!(
+                    "Notification capacity is full ({MAX_IN_FLIGHT_NOTIFICATIONS} in-flight notifications)"
+                );
+                if let Some(completion) = completion {
+                    let _ = completion.send(Err(error));
+                } else {
+                    eprintln!("Async observer notification rejected: {error}");
+                }
+                return;
+            }
+        },
+    };
+
     let Some(runtime) = runtime else {
         if let Some(completion) = completion {
             let _ = completion.send(Err(
@@ -360,7 +403,7 @@ fn dispatch_notification<T: Clone>(
         match inner.async_sender.as_ref() {
             Some(sender) if !sender.is_closed() => (sender.clone(), None),
             _ => {
-                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let (sender, receiver) = tokio::sync::mpsc::channel(MAX_IN_FLIGHT_NOTIFICATIONS);
                 inner.async_sender = Some(sender.clone());
                 (sender, Some(receiver))
             }
@@ -370,40 +413,50 @@ fn dispatch_notification<T: Clone>(
     if let Some(receiver) = receiver {
         runtime.spawn(run_async_notifications(receiver));
     }
-    if sender
-        .send(AsyncNotification {
-            futures: async_futures,
-            completion,
-            error: async_error,
-        })
-        .is_err()
-    {
-        eprintln!("Async observer worker stopped before accepting a notification");
+    let notification = AsyncNotification {
+        futures: async_futures,
+        completion,
+        error: async_error,
+        _permit: match permit {
+            Some(permit) => permit,
+            None => return,
+        },
+    };
+    if let Err(error) = sender.try_send(notification) {
+        let notification = error.into_inner();
+        if let Some(completion) = notification.completion {
+            let _ = completion.send(Err(
+                "Async observer worker stopped before accepting a notification".to_string(),
+            ));
+        } else {
+            eprintln!("Async observer worker stopped before accepting a notification");
+        }
     }
 }
 
-async fn run_async_notifications(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<AsyncNotification>,
-) {
+async fn run_async_notifications(mut receiver: tokio::sync::mpsc::Receiver<AsyncNotification>) {
     while let Some(notification) = receiver.recv().await {
-        let mut tasks = JoinSet::new();
-        for future in notification.futures {
-            tasks.spawn(future);
-        }
-
-        let mut first_error = notification.error;
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                first_error.get_or_insert_with(|| error.to_string());
+        tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+            for future in notification.futures {
+                tasks.spawn(future);
             }
-        }
 
-        let result = first_error.map_or(Ok(()), Err);
-        if let Some(completion) = notification.completion {
-            let _ = completion.send(result);
-        } else if let Err(error) = result {
-            eprintln!("Detached async observer failed: {error}");
-        }
+            let mut first_error = notification.error;
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+
+            let result = first_error.map_or(Ok(()), Err);
+            drop(notification._permit);
+            if let Some(completion) = notification.completion {
+                let _ = completion.send(result);
+            } else if let Err(error) = result {
+                eprintln!("Detached async observer failed: {error}");
+            }
+        });
     }
 }
 
@@ -474,6 +527,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 pending_notifications: VecDeque::new(),
                 notifying: false,
                 async_sender: None,
+                notification_slots: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_IN_FLIGHT_NOTIFICATIONS,
+                )),
             })),
             keepalive: Arc::new(Mutex::new(Vec::new())),
         }
@@ -534,6 +590,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// synchronous observer from affecting others. If another caller is already
     /// dispatching notifications, this call enqueues its notification and may
     /// return before that notification is delivered.
+    /// At most 256 notifications may be queued or running; when capacity is exhausted,
+    /// this method returns [`PropertyError::Backpressure`] without changing the value.
     ///
     /// # Arguments
     ///
@@ -563,8 +621,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
+        let permit = try_notification_permit(&self.inner)?;
         let runtime = tokio::runtime::Handle::try_current().ok();
-        if replace_value(&self.inner, |_| new_value, None, runtime) {
+        if replace_value(&self.inner, |_| new_value, None, runtime, Some(permit)) {
             dispatch_pending(&self.inner);
         }
         Ok(())
@@ -574,9 +633,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// Notifications are dispatched in FIFO commit order. Synchronous observers
     /// run on the current dispatcher. Async observers for one update run concurrently;
-    /// separate update batches run in FIFO order and are awaited before this method
-    /// returns. If another caller is dispatching, this method waits until its
-    /// notification reaches the head of the queue.
+    /// separate batches start in FIFO order but may complete out of order. This method
+    /// waits for its update's async observers. If notification capacity is exhausted,
+    /// returns [`PropertyError::Backpressure`] without changing the value.
     ///
     /// # Arguments
     ///
@@ -608,12 +667,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub async fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
+        let permit = try_notification_permit(&self.inner)?;
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| PropertyError::TokioError {
                 reason: error.to_string(),
             })?;
         let (completion, receiver) = tokio::sync::oneshot::channel();
-        if replace_value(&self.inner, |_| new_value, Some(completion), Some(runtime)) {
+        if replace_value(
+            &self.inner,
+            |_| new_value,
+            Some(completion),
+            Some(runtime),
+            Some(permit),
+        ) {
             dispatch_pending(&self.inner);
         }
         await_async_observers(receiver).await
@@ -625,6 +691,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// without having to call `get()` and `set()` separately. The closure runs while
     /// the property is write-locked to make the update atomic, so it must not re-enter
     /// this property.
+    /// Returns [`PropertyError::Backpressure`] without changing the value if all
+    /// 256 notification slots are occupied.
     ///
     /// # Arguments
     ///
@@ -656,8 +724,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     {
         // The update closure runs under the write lock so concurrent updates cannot
         // overwrite one another. It must not re-enter this property.
+        let permit = try_notification_permit(&self.inner)?;
         let runtime = tokio::runtime::Handle::try_current().ok();
-        if replace_value(&self.inner, update_fn, None, runtime) {
+        if replace_value(&self.inner, update_fn, None, runtime, Some(permit)) {
             dispatch_pending(&self.inner);
         }
         Ok(())
@@ -667,6 +736,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// Like `update()` but awaits async observers after atomically updating the value.
     /// The update closure runs under the write lock and must not re-enter this property.
+    /// Returns [`PropertyError::Backpressure`] without changing the value if all
+    /// 256 notification slots are occupied.
     ///
     /// # Arguments
     ///
@@ -695,13 +766,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(T) -> T,
     {
+        let permit = try_notification_permit(&self.inner)?;
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| PropertyError::TokioError {
                 reason: error.to_string(),
             })?;
         // Compute and publish atomically before awaiting observer work.
         let (completion, receiver) = tokio::sync::oneshot::channel();
-        if replace_value(&self.inner, update_fn, Some(completion), Some(runtime)) {
+        if replace_value(
+            &self.inner,
+            update_fn,
+            Some(completion),
+            Some(runtime),
+            Some(permit),
+        ) {
             dispatch_pending(&self.inner);
         }
         await_async_observers(receiver).await
@@ -1124,8 +1202,38 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             if let Some(inner) = derived_inner.upgrade() {
                 let transformed = transform(new_value);
                 let runtime = tokio::runtime::Handle::try_current().ok();
-                if replace_value(&inner, |_| transformed, None, runtime) {
-                    dispatch_pending(&inner);
+                match try_notification_permit(&inner) {
+                    Ok(permit) => {
+                        if replace_value(&inner, |_| transformed, None, runtime, Some(permit)) {
+                            dispatch_pending(&inner);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Mapped-property async notifications are under backpressure: {error}"
+                        );
+                        let (old_value, new_value, observers) = {
+                            let mut inner = inner.write();
+                            let old_value =
+                                std::mem::replace(&mut inner.value, transformed.clone());
+                            (
+                                old_value,
+                                transformed,
+                                inner.observers.values().cloned().collect(),
+                            )
+                        };
+                        dispatch_notification(
+                            Notification {
+                                old_value,
+                                new_value,
+                                observers,
+                                completion: None,
+                                runtime,
+                                permit: None,
+                            },
+                            &inner,
+                        );
+                    }
                 }
             }
         }))?;
@@ -1425,7 +1533,15 @@ mod tests {
             let property = Arc::clone(&property);
             tasks.push(tokio::task::spawn_blocking(move || {
                 for _ in 0..250 {
-                    property.update(|value| value + 1).unwrap();
+                    loop {
+                        match property.update(|value| value + 1) {
+                            Ok(()) => break,
+                            Err(PropertyError::Backpressure { .. }) => {
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("unexpected update error: {error}"),
+                        }
+                    }
                 }
             }));
         }
@@ -1477,6 +1593,43 @@ mod tests {
         let property = ObservableProperty::new("hello".to_string());
         property.set_async("world".to_string()).await?;
         assert_eq!(property.get()?, "world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_observer_can_await_nested_update() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let observed_property = property.clone();
+        property.subscribe_async(move |_, new_value| {
+            let property = observed_property.clone();
+            async move {
+                if new_value == 1 {
+                    property.set_async(2).await.unwrap();
+                }
+            }
+        })?;
+
+        property.set_async(1).await?;
+        assert_eq!(property.get()?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_notification_capacity_returns_backpressure() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        property.subscribe_async(|_, _| async {
+            std::future::pending::<()>().await;
+        })?;
+
+        for value in 1..=MAX_IN_FLIGHT_NOTIFICATIONS {
+            property.set(value)?;
+        }
+
+        assert!(matches!(
+            property.set(MAX_IN_FLIGHT_NOTIFICATIONS + 1),
+            Err(PropertyError::Backpressure { capacity }) if capacity == MAX_IN_FLIGHT_NOTIFICATIONS
+        ));
+        assert_eq!(property.get()?, MAX_IN_FLIGHT_NOTIFICATIONS);
         Ok(())
     }
 
@@ -1588,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_async_observer_batches_run_in_update_order() -> Result<(), PropertyError> {
+    async fn test_async_observer_batches_start_in_update_order() -> Result<(), PropertyError> {
         let property = Arc::new(ObservableProperty::new(0));
         let first_started = Arc::new(tokio::sync::Notify::new());
         let release_first = Arc::new(tokio::sync::Notify::new());
@@ -1620,12 +1773,12 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        assert!(observed.lock().is_empty());
+        second.await.map_err(PropertyError::from)??;
+        assert_eq!(*observed.lock(), vec![2]);
         release_first.notify_one();
         first.await.map_err(PropertyError::from)??;
-        second.await.map_err(PropertyError::from)??;
 
-        assert_eq!(*observed.lock(), vec![1, 2]);
+        assert_eq!(*observed.lock(), vec![2, 1]);
         Ok(())
     }
 

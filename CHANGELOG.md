@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `set_async()` and `update_async()` now await async observers and report observer task panics.
 - Property updates enqueue notification snapshots in commit order and dispatch them FIFO.
-- Async observer batches for separate updates now run in FIFO order; observers within one update still run concurrently.
+- Async observer batches are started in FIFO order and may run concurrently; observers within one update also run concurrently.
 - `update()` and `update_async()` now apply their update closures atomically while holding the property write lock. Update closures must not re-enter the same property.
 - Async observers triggered by synchronous setters run as detached Tokio tasks and require an active Tokio runtime.
+- Limit each property's queued and running notifications to 256. Setters fail with `PropertyError::Backpressure` before committing an update when capacity is exhausted.
+- Mapped properties continue updating their current value under notification pressure; rejected async notifications are logged.
 - Corrected package licensing metadata to declare `MIT OR Apache-2.0`.
 
 ### Fixed
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Regression tests for concurrent updates, FIFO notification delivery, async observer completion and panics, and mapped-property cleanup.
+- Regression tests for nested awaited updates from async observers and notification-capacity backpressure.
 - CI checks for the declared Rust 1.89 MSRV and stable, formatting, Clippy, documentation, doctests, and package contents.
 
 ## [0.2.0] - 2025-09-29
