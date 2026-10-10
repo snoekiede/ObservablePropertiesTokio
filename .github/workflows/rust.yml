@@ -20,7 +20,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Test all targets
-        run: cargo test --all-targets --offline
+        run: cargo test --all-targets --locked
 
   quality:
     runs-on: ubuntu-latest
