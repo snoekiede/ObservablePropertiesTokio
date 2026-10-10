@@ -14,7 +14,12 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     let counter_clone = update_counter.clone();
     property.subscribe(Arc::new(move |old, new| {
         counter_clone.fetch_add(1, Ordering::SeqCst);
-        println!("🔄 Observer: {} -> {} (thread: {:?})", old, new, std::thread::current().id());
+        println!(
+            "🔄 Observer: {} -> {} (thread: {:?})",
+            old,
+            new,
+            std::thread::current().id()
+        );
     }))?;
 
     println!("\n--- Spawning multiple tasks to update the property ---");
@@ -38,7 +43,9 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
     // Wait for all tasks to complete
     for (i, handle) in handles.into_iter().enumerate() {
-        handle.await.expect(&format!("Task {} panicked", i + 1));
+        handle
+            .await
+            .unwrap_or_else(|_| panic!("Task {} panicked", i + 1));
     }
 
     // Create more tasks using async setting
@@ -61,7 +68,9 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
     // Wait for all async tasks to complete
     for (i, handle) in async_handles.into_iter().enumerate() {
-        handle.await.expect(&format!("Async task {} panicked", i + 6));
+        handle
+            .await
+            .unwrap_or_else(|_| panic!("Async task {} panicked", i + 6));
     }
 
     // Give a moment for any remaining async observers to complete
@@ -73,7 +82,10 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     println!("\n--- Results ---");
     println!("Final property value: {}", final_value);
     println!("Total observer notifications: {}", total_updates);
-    println!("Property is thread-safe and handled {} concurrent updates!", total_updates);
+    println!(
+        "Property is thread-safe and handled {} concurrent updates!",
+        total_updates
+    );
 
     Ok(())
 }

@@ -1,5 +1,4 @@
 use observable_property_tokio::ObservableProperty;
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), observable_property_tokio::PropertyError> {
