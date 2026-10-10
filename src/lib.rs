@@ -257,6 +257,7 @@ struct Notification<T> {
     completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     runtime: Option<tokio::runtime::Handle>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    coalesced_mapped: bool,
 }
 
 fn try_notification_permit<T>(
@@ -295,7 +296,59 @@ where
         completion,
         runtime,
         permit,
+        coalesced_mapped: false,
     });
+
+    if inner.notifying {
+        false
+    } else {
+        inner.notifying = true;
+        true
+    }
+}
+
+fn replace_mapped_value_under_backpressure<T: Clone>(
+    inner: &Arc<RwLock<InnerProperty<T>>>,
+    new_value: T,
+    runtime: Option<tokio::runtime::Handle>,
+) -> bool {
+    let mut inner = inner.write();
+    let old_value = std::mem::replace(&mut inner.value, new_value.clone());
+    let observers = inner.observers.values().cloned().collect();
+
+    if let Some(index) = inner
+        .pending_notifications
+        .iter()
+        .position(|notification| notification.coalesced_mapped)
+    {
+        if let Some(mut notification) = inner.pending_notifications.remove(index) {
+            notification.old_value = old_value;
+            notification.new_value = new_value;
+            notification.observers = observers;
+            notification.runtime = runtime;
+            inner.pending_notifications.push_back(notification);
+        } else {
+            inner.pending_notifications.push_back(Notification {
+                old_value,
+                new_value,
+                observers,
+                completion: None,
+                runtime,
+                permit: None,
+                coalesced_mapped: true,
+            });
+        }
+    } else {
+        inner.pending_notifications.push_back(Notification {
+            old_value,
+            new_value,
+            observers,
+            completion: None,
+            runtime,
+            permit: None,
+            coalesced_mapped: true,
+        });
+    }
 
     if inner.notifying {
         false
@@ -333,6 +386,7 @@ fn dispatch_notification<T: Clone>(
         completion,
         runtime,
         permit,
+        coalesced_mapped: _,
     } = notification;
     let mut async_futures = Vec::new();
     let mut async_error = None;
@@ -1156,7 +1210,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// This creates a derived property that tracks changes to the original property,
     /// with a transformation applied. The result is an ordinary property and can also
     /// be changed directly. The source observer is removed when the final clone of the
-    /// derived property is dropped.
+    /// derived property is dropped. If the derived property's notification capacity is
+    /// exhausted, source updates are coalesced into its single pending mapped notification;
+    /// the derived value still tracks the latest source value.
     ///
     /// # Arguments
     ///
@@ -1196,7 +1252,6 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let transform = Arc::new(transform);
         let initial_value = transform(&self.get()?);
         let derived = ObservableProperty::new(initial_value);
-
         let derived_inner = Arc::downgrade(&derived.inner);
         let id = self.subscribe(Arc::new(move |_, new_value| {
             if let Some(inner) = derived_inner.upgrade() {
@@ -1208,31 +1263,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                             dispatch_pending(&inner);
                         }
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "Mapped-property async notifications are under backpressure: {error}"
-                        );
-                        let (old_value, new_value, observers) = {
-                            let mut inner = inner.write();
-                            let old_value =
-                                std::mem::replace(&mut inner.value, transformed.clone());
-                            (
-                                old_value,
-                                transformed,
-                                inner.observers.values().cloned().collect(),
-                            )
-                        };
-                        dispatch_notification(
-                            Notification {
-                                old_value,
-                                new_value,
-                                observers,
-                                completion: None,
-                                runtime,
-                                permit: None,
-                            },
-                            &inner,
-                        );
+                    Err(_) => {
+                        if replace_mapped_value_under_backpressure(&inner, transformed, runtime) {
+                            dispatch_pending(&inner);
+                        }
                     }
                 }
             }
@@ -1836,6 +1870,75 @@ mod tests {
 
         assert_eq!(property.get()?, 2);
         assert_eq!(mapped.get()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mapped_property_backpressure_preserves_dispatch_order() -> Result<(), PropertyError> {
+        let source = ObservableProperty::new(0);
+        let mapped = source.map(|value| *value)?;
+        let mut held_slots = (0..MAX_IN_FLIGHT_NOTIFICATIONS - 1)
+            .map(|_| {
+                mapped
+                    .inner
+                    .read()
+                    .notification_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("test should acquire notification slot")
+            })
+            .collect::<Vec<_>>();
+        let callback_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_callback = Arc::new(std::sync::Barrier::new(2));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_count = Arc::new(AtomicUsize::new(0));
+
+        let entered_clone = Arc::clone(&callback_entered);
+        let release_clone = Arc::clone(&release_callback);
+        let observed_clone = Arc::clone(&observed);
+        let callback_count_clone = Arc::clone(&callback_count);
+        mapped.subscribe(Arc::new(move |old_value, new_value| {
+            if *new_value == 100 && callback_count_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_clone.wait();
+                release_clone.wait();
+            }
+            observed_clone.lock().push((*old_value, *new_value));
+        }))?;
+
+        let update_mapped = mapped.clone();
+        let pending_update = std::thread::spawn(move || update_mapped.set(100));
+        callback_entered.wait();
+
+        for value in 1..=100 {
+            source.set(value)?;
+        }
+        assert_eq!(mapped.get()?, 100);
+        {
+            let inner = mapped.inner.read();
+            assert_eq!(inner.pending_notifications.len(), 1);
+            assert_eq!(inner.pending_notifications[0].old_value, 99);
+            assert_eq!(inner.pending_notifications[0].new_value, 100);
+        }
+        assert!(observed.lock().is_empty());
+
+        drop(held_slots.pop().expect("one held slot should be available"));
+        mapped.set(50)?;
+        source.set(2)?;
+        {
+            let inner = mapped.inner.read();
+            assert_eq!(inner.pending_notifications.len(), 2);
+            assert_eq!(inner.pending_notifications[0].old_value, 100);
+            assert_eq!(inner.pending_notifications[0].new_value, 50);
+            assert_eq!(inner.pending_notifications[1].old_value, 50);
+            assert_eq!(inner.pending_notifications[1].new_value, 2);
+        }
+
+        release_callback.wait();
+        pending_update
+            .join()
+            .expect("mapped update thread panicked")?;
+        assert_eq!(*observed.lock(), vec![(0, 100), (100, 50), (50, 2)]);
+        held_slots.clear();
         Ok(())
     }
 

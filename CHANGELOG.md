@@ -14,12 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `update()` and `update_async()` now apply their update closures atomically while holding the property write lock. Update closures must not re-enter the same property.
 - Async observers triggered by synchronous setters run as detached Tokio tasks and require an active Tokio runtime.
 - Limit each property's queued and running notifications to 256. Setters fail with `PropertyError::Backpressure` before committing an update when capacity is exhausted.
-- Mapped properties continue updating their current value under notification pressure; rejected async notifications are logged.
+- Mapped properties continue updating their current value under notification pressure, while queued mapped notifications are coalesced to the latest value to keep memory bounded.
 - Corrected package licensing metadata to declare `MIT OR Apache-2.0`.
 
 ### Fixed
 - Prevented concurrent updates from overwriting one another.
 - Prevented mapped properties from becoming stale when concurrent notifications arrive.
+- Keep mapped-property notifications on the FIFO dispatcher and coalesce overflow notifications to prevent unbounded queue growth while preserving the coalesced notification's latest old/new value pair.
 - Unregister the source observer when the last clone of a mapped property is dropped.
 
 ### Added
