@@ -45,7 +45,10 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     property.set(3)?;
     property.set(4)?;
 
-    println!("Final counter value: {}", counter_display.load(Ordering::SeqCst));
+    println!(
+        "Final counter value: {}",
+        counter_display.load(Ordering::SeqCst)
+    );
     println!("Notice that the counter didn't increase after the subscription was dropped!");
 
     Ok(())

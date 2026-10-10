@@ -13,7 +13,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
         Arc::new(|old, new| {
             println!("✅ Value increased: {} -> {}", old, new);
         }),
-        |old, new| new > old
+        |old, new| new > old,
     )?;
 
     // Observer that only triggers when value decreases
@@ -21,7 +21,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
         Arc::new(|old, new| {
             println!("⬇️ Value decreased: {} -> {}", old, new);
         }),
-        |old, new| new < old
+        |old, new| new < old,
     )?;
 
     // Observer that only triggers on even numbers
@@ -29,7 +29,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
         Arc::new(|_old, new| {
             println!("🎯 New value is even: {}", new);
         }),
-        |_old, new| new % 2 == 0
+        |_old, new| new % 2 == 0,
     )?;
 
     println!("\n--- Testing filtered observers ---");

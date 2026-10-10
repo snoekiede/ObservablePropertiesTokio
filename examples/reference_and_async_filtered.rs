@@ -1,6 +1,5 @@
 use observable_property_tokio::ObservableProperty;
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 // A slightly expensive data structure to demonstrate benefits of get_ref()
 #[derive(Clone, Debug)]
@@ -71,10 +70,13 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
             let old_avg = old_data.average();
             let new_avg = new_data.average();
-            println!("ASYNC NOTIFICATION: Average changed from {:.4} to {:.4}", old_avg, new_avg);
+            println!(
+                "ASYNC NOTIFICATION: Average changed from {:.4} to {:.4}",
+                old_avg, new_avg
+            );
         },
         // Filter: only notify when the average increases
-        |old_data, new_data| new_data.average() > old_data.average()
+        |old_data, new_data| new_data.average() > old_data.average(),
     )?;
 
     // Update the dataset multiple times
@@ -82,7 +84,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     property.update(|mut dataset| {
         dataset.id = "dataset-2".to_string();
         // Replace with values that will decrease the average
-        dataset.data = (0..10_000).map(|i| (i as f64 / 200.0)).collect();
+        dataset.data = (0..10_000).map(|i| i as f64 / 200.0).collect();
         dataset
     })?;
 
@@ -93,7 +95,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     property.update(|mut dataset| {
         dataset.id = "dataset-3".to_string();
         // Replace with values that will increase the average
-        dataset.data = (0..10_000).map(|i| (i as f64 / 50.0)).collect();
+        dataset.data = (0..10_000).map(|i| i as f64 / 50.0).collect();
         dataset
     })?;
 
@@ -102,16 +104,18 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
     // One more update with mixed changes
     println!("\nFinal update with mixed changes (should trigger observer)...");
-    property.update_async(|mut dataset| {
-        dataset.id = "dataset-4".to_string();
-        dataset.timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        // Another increase in average
-        dataset.data = (0..10_000).map(|i| (i as f64 / 25.0)).collect();
-        dataset
-    }).await?;
+    property
+        .update_async(|mut dataset| {
+            dataset.id = "dataset-4".to_string();
+            dataset.timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            // Another increase in average
+            dataset.data = (0..10_000).map(|i| i as f64 / 25.0).collect();
+            dataset
+        })
+        .await?;
 
     // Wait for async processing
     sleep(Duration::from_millis(50)).await;

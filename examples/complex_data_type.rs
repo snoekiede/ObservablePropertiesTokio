@@ -34,11 +34,15 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
     // Subscribe to any changes to the user
     let _subscription = user_property.subscribe_with_token(Arc::new(|old_user, new_user| {
+        println!("ID: {} -> {}", old_user.id, new_user.id);
         println!("\nUser changed:");
         println!("Name: {} -> {}", old_user.name, new_user.name);
         println!("Email: {} -> {}", old_user.email, new_user.email);
         println!("Active: {} -> {}", old_user.active, new_user.active);
-        println!("Login count: {} -> {}", old_user.login_count, new_user.login_count);
+        println!(
+            "Login count: {} -> {}",
+            old_user.login_count, new_user.login_count
+        );
     }))?;
 
     // Create filtered subscriptions for specific field changes
@@ -46,7 +50,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
         Arc::new(|_, new_user| {
             println!("\n[NAME CHANGE ALERT] User name is now: {}", new_user.name);
         }),
-        |old_user, new_user| old_user.name != new_user.name
+        |old_user, new_user| old_user.name != new_user.name,
     )?;
 
     let _status_change_subscription = user_property.subscribe_filtered_with_token(
@@ -57,7 +61,7 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
                 println!("\n[STATUS ALERT] User is now inactive");
             }
         }),
-        |old_user, new_user| old_user.active != new_user.active
+        |old_user, new_user| old_user.active != new_user.active,
     )?;
 
     // Update the user (modifying multiple fields)

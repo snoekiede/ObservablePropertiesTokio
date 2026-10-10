@@ -1,7 +1,7 @@
 # Observable Property with Tokio
 
 [![Crates.io](https://img.shields.io/crates/v/observable-property-tokio.svg)](https://crates.io/crates/observable-property-tokio)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 A thread-safe, async-compatible observable property implementation for Rust that allows you to observe changes to values using Tokio for asynchronous operations. This crate is inspired by the observer pattern and is designed to work seamlessly in multi-threaded environments.
 
@@ -9,14 +9,15 @@ A thread-safe, async-compatible observable property implementation for Rust that
 
 **This crate is provided "as is", without warranty of any kind, express or implied.** The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios.
 
-### Key Considerations:
+### Operational considerations
 
-- **Production Use**: Users should thoroughly test the crate in their specific environment before deploying to production
-- **Performance**: The current implementation spawns individual Tokio tasks for each observer, which may not be optimal for high-frequency updates or large numbers of observers
-- **Memory Usage**: Observer callbacks are stored as `Arc<dyn Fn>` which may have memory overhead considerations
-- **API Stability**: The API may change in future versions as the design evolves
-- **Error Handling**: All operations return `Result` types - proper error handling is essential
-- **Resource Cleanup**: Use `clear_observers()` or `shutdown()` methods for proper cleanup in production
+- Test the crate with your workload before adopting it in production; this project does not provide a production-readiness guarantee.
+- `set()` dispatches async observers as detached Tokio tasks. Use `set_async()` or `update_async()` when the caller must wait for async observer completion or receive task join errors.
+- `set_async()` and `update_async()` run async observers concurrently and wait for all of them. Synchronous observers run on the caller's task.
+- `update()` and `update_async()` run the update closure under the property's write lock to make updates atomic. Do not call back into the same property from that closure.
+- `clear_observers()` and `shutdown()` remove registered observers but do not cancel async observer work that has already started.
+- Each async observer runs in its own Tokio task; high update rates or large observer counts can add task scheduling and cloning overhead.
+- The `map()` observer is retained only while at least one clone of the derived property remains alive.
 
 **Performance characteristics may vary** depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
 
@@ -27,13 +28,12 @@ By using this crate, you acknowledge that you have read and understood this disc
 - **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access with optimized locking
 - **Observer pattern**: Subscribe to property changes with callbacks
 - **Filtered observers**: Only notify when specific conditions are met
-- **Async notifications**: Non-blocking observer notifications with Tokio tasks
+- **Async notifications**: Async observers can be awaited with `set_async()` and `update_async()`
 - **Panic isolation**: Observer panics don't crash the system
 - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
-- **Proper error handling**: All operations return `Result` types instead of panicking
-- **Resource management**: Built-in cleanup methods for production environments
-- **Memory leak prevention**: Async operations properly await task completion
-- **Production-ready**: Comprehensive error handling and resource cleanup
+- **Error reporting**: Async observer task failures are returned from async update methods
+- **Resource management**: Built-in observer cleanup methods and RAII subscription tokens
+- **Derived-property cleanup**: Dropping the final mapped property unregisters its source observer
 
 ## 📦 Installation
 
@@ -42,7 +42,7 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 observable-property-tokio = "0.3.0"
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "time"] }
 ```
 
 ## 🔧 Quick Start
@@ -83,23 +83,17 @@ async fn main() -> Result<(), observable_property_tokio::PropertyError> {
 
 ```rust
 use observable_property_tokio::ObservableProperty;
-use tokio::time::{sleep, Duration};
-
 #[tokio::main]
 async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     let property = ObservableProperty::new(0);
 
     // Subscribe with an async handler
     property.subscribe_async(|old, new| async move {
-        // Simulate async work
-        sleep(Duration::from_millis(100)).await;
+        // Perform async work
         println!("Async observer: {} -> {}", old, new);
     })?;
 
     property.set_async(42).await?;
-
-    // Give time for async observers to complete
-    sleep(Duration::from_millis(200)).await;
 
     Ok(())
 }
@@ -268,38 +262,21 @@ cargo run --example property_mapping
 - `unsubscribe(id: ObserverId) -> Result<bool, PropertyError>` - Remove observer
 - `observer_count() -> usize` - Get number of registered observers
 - `clear_observers() -> Result<(), PropertyError>` - Remove all observers
-- `shutdown() -> Result<(), PropertyError>` - Perform comprehensive cleanup
+- `shutdown() -> Result<(), PropertyError>` - Remove registered observers
 - `map<U, F>(transform: F) -> Result<ObservableProperty<U>, PropertyError>` - Create derived property
 
 ## ⚡ Performance Considerations
 
-- **Observer Count**: Each observer is called in a separate Tokio task for `set_async()`, which provides good isolation but may have overhead for many observers
+- **Observer Count**: Async observers are each called in a separate Tokio task by `set_async()`, which provides concurrency but may have overhead for many observers
 - **Update Frequency**: High-frequency updates may benefit from batching or debouncing at the application level
 - **Memory Usage**: Observers are stored as `Arc<dyn Fn>` which has some memory overhead
 - **Lock Contention**: Uses `RwLock` which allows multiple readers but exclusive writers
-- **Resource Cleanup**: Use cleanup methods to prevent memory leaks in long-running applications
-- **Task Management**: Async operations now properly await completion, preventing resource leaks
+- **Resource Cleanup**: Dropping the final mapped property unregisters its source observer. Clear other subscriptions explicitly or use RAII subscription tokens.
+- **Task Management**: `set_async()` and `update_async()` await async observer tasks; `set()` and `update()` detach async observer tasks.
 
-## 🔄 Recent Improvements
+## ✅ Validation
 
-This crate has been enhanced for production readiness:
-
-### Version 0.2.0+ Improvements
-- **Memory leak prevention**: Fixed potential memory leaks in `set_async()` by properly awaiting task completion
-- **Panic-safe operations**: Eliminated potential panics in `map()` method with proper error handling
-- **Breaking change**: `map()` method now returns `Result<ObservableProperty<U>, PropertyError>` for enhanced safety
-  - Migration: Add `?` to existing `map()` calls: `property.map(|x| x * 2)?`
-- **Resource management**: Added `clear_observers()` and `shutdown()` methods for production cleanup
-- **Enhanced error handling**: All operations now handle errors gracefully without unwrap/expect calls
-- **Comprehensive testing**: Added tests for cleanup methods and edge cases
-
-### Production Readiness Features
-- ✅ Memory leak prevention in async operations
-- ✅ Proper error propagation without panics
-- ✅ Resource cleanup methods for application lifecycle
-- ✅ Comprehensive test coverage including edge cases
-- ✅ Thread-safe operations with proper locking
-- ✅ Panic isolation for observer functions
+Continuous integration tests the declared Rust 1.89 minimum and stable, checks formatting and Clippy warnings, builds the API documentation, and verifies package contents. These checks do not replace application-specific testing or provide a production-readiness guarantee.
 
 ## 🤝 Contributing
 
@@ -309,9 +286,9 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 Licensed under either
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](https://www.google.com/search?q=LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 
-* MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 
 

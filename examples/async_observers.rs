@@ -1,7 +1,7 @@
 use observable_property_tokio::ObservableProperty;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<(), observable_property_tokio::PropertyError> {

@@ -68,13 +68,15 @@
 //! }
 //! ```
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::panic;
+use std::pin::Pin;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use thiserror::Error;
-use tokio::task::{self, JoinError};
+use tokio::task::{JoinError, JoinSet};
 
 /// Errors that can occur when working with ObservableProperty
 #[derive(Error, Debug, Clone)]
@@ -83,21 +85,21 @@ pub enum PropertyError {
     #[error("Failed to acquire read lock: {context}")]
     ReadLockError {
         /// Context describing what operation was being attempted
-        context: String
+        context: String,
     },
 
     /// Failed to acquire a write lock on the property
     #[error("Failed to acquire write lock: {context}")]
     WriteLockError {
         /// Context describing what operation was being attempted
-        context: String
+        context: String,
     },
 
     /// Attempted to unsubscribe an observer that doesn't exist
     #[error("Observer with ID {id} not found")]
     ObserverNotFound {
         /// The ID of the observer that wasn't found
-        id: ObserverId
+        id: ObserverId,
     },
 
     /// The property's lock has been poisoned due to a panic in another thread
@@ -108,14 +110,14 @@ pub enum PropertyError {
     #[error("Observer execution failed: {reason}")]
     ObserverError {
         /// Description of what went wrong
-        reason: String
+        reason: String,
     },
 
     /// A Tokio-related error occurred
     #[error("Tokio runtime error: {reason}")]
     TokioError {
         /// Description of what went wrong
-        reason: String
+        reason: String,
     },
 
     /// A task join error occurred
@@ -125,6 +127,14 @@ pub enum PropertyError {
 
 /// Function type for observers that get called when property values change
 pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
+type AsyncObserver<T> =
+    Arc<dyn Fn(T, T) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> + Send + Sync>;
+
+#[derive(Clone)]
+enum ObserverCallback<T> {
+    Sync(Observer<T>),
+    Async(AsyncObserver<T>),
+}
 
 /// Unique identifier for registered observers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,12 +224,92 @@ impl fmt::Display for ObserverId {
 /// ```
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
+    keepalive: Arc<Mutex<Vec<Box<dyn Send + Sync>>>>,
 }
 
 struct InnerProperty<T> {
     value: T,
-    observers: HashMap<ObserverId, Observer<T>>,
+    observers: HashMap<ObserverId, ObserverCallback<T>>,
     next_id: usize,
+}
+
+fn replace_value<T, F>(
+    inner: &Arc<RwLock<InnerProperty<T>>>,
+    update_fn: F,
+) -> (T, T, Vec<ObserverCallback<T>>)
+where
+    T: Clone,
+    F: FnOnce(T) -> T,
+{
+    let mut inner = inner.write();
+    let current_value = inner.value.clone();
+    let new_value = update_fn(current_value);
+    let old_value = std::mem::replace(&mut inner.value, new_value.clone());
+    let observers = inner.observers.values().cloned().collect();
+    (old_value, new_value, observers)
+}
+
+fn notify_sync<T: Clone>(old_value: T, new_value: T, observers: Vec<ObserverCallback<T>>) {
+    for observer in observers {
+        match observer {
+            ObserverCallback::Sync(observer) => {
+                if let Err(error) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic: {error:?}");
+                }
+            }
+            ObserverCallback::Async(observer) => {
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    if let Some(future) = observer(old_value.clone(), new_value.clone()) {
+                        tokio::spawn(future);
+                    }
+                }));
+                if let Err(error) = result {
+                    eprintln!("Failed to spawn async observer: {error:?}");
+                }
+            }
+        }
+    }
+}
+
+async fn notify_async<T: Clone>(
+    old_value: T,
+    new_value: T,
+    observers: Vec<ObserverCallback<T>>,
+) -> Result<(), PropertyError> {
+    let mut tasks = JoinSet::new();
+    for observer in observers {
+        match observer {
+            ObserverCallback::Sync(observer) => {
+                if let Err(error) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic: {error:?}");
+                }
+            }
+            ObserverCallback::Async(observer) => {
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(old_value.clone(), new_value.clone())
+                })) {
+                    Ok(Some(future)) => {
+                        tasks.spawn(future);
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("Async observer panic: {error:?}"),
+                }
+            }
+        }
+    }
+
+    let mut first_join_error = None;
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            first_join_error.get_or_insert(error);
+        }
+    }
+
+    first_join_error.map_or(Ok(()), |error| Err(PropertyError::from(error)))
 }
 
 pub struct PropertyHandle<T: Clone + Send + Sync + 'static> {
@@ -278,6 +368,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 observers: HashMap::new(),
                 next_id: 0,
             })),
+            keepalive: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -330,7 +421,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// 1. Acquire a write lock (blocking other readers/writers)
     /// 2. Update the value and capture a snapshot of observers
     /// 3. Release the lock
-    /// 4. Notify all observers sequentially with the old and new values
+    /// 4. Notify synchronous observers sequentially and launch async observers
+    ///    as detached Tokio tasks
     ///
     /// Observer notifications are wrapped in panic recovery to prevent one
     /// misbehaving observer from affecting others.
@@ -363,31 +455,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, observers_snapshot) = {
-            let mut inner = self.inner.write();
-
-            let old_value = inner.value.clone();
-            inner.value = new_value.clone();
-            let observers_snapshot: Vec<Observer<T>> = inner.observers.values().cloned().collect();
-            (old_value, observers_snapshot)
-        };
-
-        for observer in observers_snapshot {
-            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                observer(&old_value, &new_value);
-            })) {
-                eprintln!("Observer panic: {:?}", e);
-            }
-        }
-
+        let (old_value, new_value, observers) = replace_value(&self.inner, |_| new_value);
+        notify_sync(old_value, new_value, observers);
         Ok(())
     }
 
-    /// Sets the property to a new value and notifies observers asynchronously using Tokio tasks
+    /// Sets the property and awaits all registered async observers.
     ///
-    /// This method is similar to `set()` but spawns observers in individual Tokio tasks
-    /// for non-blocking operation. This is useful when observers might perform
-    /// time-consuming operations.
+    /// Async observers run concurrently. Synchronous observers run on the calling
+    /// task before this method waits for async observers. If an async observer task
+    /// panics, all started observers are still awaited and the first join error is
+    /// returned.
     ///
     /// # Arguments
     ///
@@ -402,70 +480,33 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```rust
     /// use observable_property_tokio::ObservableProperty;
     /// use std::sync::Arc;
-    /// use tokio::time::{sleep, Duration};
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
     ///     let property = ObservableProperty::new(0);
     ///
-    ///     property.subscribe(Arc::new(move |old, new| {
-    ///         // This observer does slow work but won't block the caller
+    ///     property.subscribe_async(|old, new| async move {
+    ///         // This observer can perform async work
     ///         println!("Slow observer: {} -> {}", old, new);
-    ///     }))?;
+    ///     })?;
     ///
-    ///     // This returns immediately even though observer may be slow
+    ///     // Waits for the async observer to finish
     ///     property.set_async(42).await?;
-    ///
-    ///     // Give time for observers to run
-    ///     sleep(Duration::from_millis(10)).await;
     ///
     ///     Ok(())
     /// }
     /// ```
     pub async fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, observers_snapshot) = {
-            let mut inner = self.inner.write();
-
-            let old_value = inner.value.clone();
-            inner.value = new_value.clone();
-            let observers_snapshot: Vec<Observer<T>> = inner.observers.values().cloned().collect();
-            (old_value, observers_snapshot)
-        };
-
-        if observers_snapshot.is_empty() {
-            return Ok(());
-        }
-
-        // Spawn a separate Tokio task for each observer
-        let mut tasks = Vec::with_capacity(observers_snapshot.len());
-
-        for observer in observers_snapshot {
-            let old_val = old_value.clone();
-            let new_val = new_value.clone();
-
-            let task = task::spawn(async move {
-                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    observer(&old_val, &new_val);
-                })) {
-                    eprintln!("Observer panic in task: {:?}", e);
-                }
-            });
-
-            tasks.push(task);
-        }
-
-        // Wait for all tasks to complete to prevent resource leaks
-        for task in tasks {
-            task.await.map_err(|e| PropertyError::JoinError(format!("Task join error: {}", e)))?;
-        }
-
-        Ok(())
+        let (old_value, new_value, observers) = replace_value(&self.inner, |_| new_value);
+        notify_async(old_value, new_value, observers).await
     }
 
     /// Update the property value using a closure that has access to the current value
     ///
     /// This is a more ergonomic way to update a property based on its current value,
-    /// without having to call `get()` and `set()` separately.
+    /// without having to call `get()` and `set()` separately. The closure runs while
+    /// the property is write-locked to make the update atomic, so it must not re-enter
+    /// this property.
     ///
     /// # Arguments
     ///
@@ -495,13 +536,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(T) -> T,
     {
-        let new_value = update_fn(self.get()?);
-        self.set(new_value)
+        // The update closure runs under the write lock so concurrent updates cannot
+        // overwrite one another. It must not re-enter this property.
+        let (old_value, new_value, observers) = replace_value(&self.inner, update_fn);
+        notify_sync(old_value, new_value, observers);
+        Ok(())
     }
 
     /// Update the property value asynchronously using a closure
     ///
-    /// Like `update()` but uses `set_async()` for the update.
+    /// Like `update()` but awaits async observers after atomically updating the value.
+    /// The update closure runs under the write lock and must not re-enter this property.
     ///
     /// # Arguments
     ///
@@ -530,14 +575,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(T) -> T,
     {
-        let new_value = update_fn(self.get()?);
-        self.set_async(new_value).await
+        // Compute and publish atomically before awaiting observer work.
+        let (old_value, new_value, observers) = replace_value(&self.inner, update_fn);
+        notify_async(old_value, new_value, observers).await
     }
 
     /// Subscribes an observer function to be called when the property changes
     ///
     /// The observer function will be called with the old and new values whenever
-    /// the property is modified via `set()` or `set_async()`.
+    /// the property is modified. Async observer work is detached when a property
+    /// is changed with `set()`; use `set_async()` to await completion and receive
+    /// task join errors.
     ///
     /// # Arguments
     ///
@@ -571,8 +619,34 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let mut inner = self.inner.write();
 
         let id = ObserverId(inner.next_id);
-        inner.next_id += 1;
-        inner.observers.insert(id, observer);
+        inner.next_id =
+            inner
+                .next_id
+                .checked_add(1)
+                .ok_or_else(|| PropertyError::ObserverError {
+                    reason: "Observer ID space exhausted".to_string(),
+                })?;
+        inner.observers.insert(id, ObserverCallback::Sync(observer));
+        Ok(id)
+    }
+
+    fn subscribe_async_callback(
+        &self,
+        observer: AsyncObserver<T>,
+    ) -> Result<ObserverId, PropertyError> {
+        let mut inner = self.inner.write();
+
+        let id = ObserverId(inner.next_id);
+        inner.next_id =
+            inner
+                .next_id
+                .checked_add(1)
+                .ok_or_else(|| PropertyError::ObserverError {
+                    reason: "Observer ID space exhausted".to_string(),
+                })?;
+        inner
+            .observers
+            .insert(id, ObserverCallback::Async(observer));
         Ok(id)
     }
 
@@ -769,7 +843,6 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// ```rust
     /// use observable_property_tokio::ObservableProperty;
-    /// use std::sync::Arc;
     /// use tokio::time::{sleep, Duration};
     ///
     /// #[tokio::main]
@@ -785,9 +858,6 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     ///     property.set_async(42).await?;
     ///
-    ///     // Give time for observers to complete
-    ///     sleep(Duration::from_millis(20)).await;
-    ///
     ///     Ok(())
     /// }
     /// ```
@@ -796,21 +866,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         F: Fn(T, T) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        // Wrap the handler in an Arc so we can clone it for each invocation
         let handler = Arc::new(handler);
-
-        let observer = Arc::new(move |old: &T, new: &T| {
-            let old_val = old.clone();
-            let new_val = new.clone();
-            // Clone the handler so we can move it into the task
+        let observer = Arc::new(move |old: T, new: T| {
             let handler_clone = Arc::clone(&handler);
-
-            tokio::spawn(async move {
-                handler_clone(old_val, new_val).await;
-            });
+            Some(Box::pin(async move {
+                handler_clone(old, new).await;
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>)
         });
 
-        self.subscribe(observer)
+        self.subscribe_async_callback(observer)
     }
 
     /// Subscribe with an async handler that is filtered
@@ -869,26 +933,25 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let filter = Arc::new(filter);
         let handler = Arc::new(handler);
 
-        let observer = Arc::new(move |old: &T, new: &T| {
-            if filter(old, new) {
-                let old_val = old.clone();
-                let new_val = new.clone();
+        let observer = Arc::new(move |old: T, new: T| {
+            if filter(&old, &new) {
                 let handler_clone = Arc::clone(&handler);
-
-                tokio::spawn(async move {
-                    handler_clone(old_val, new_val).await;
-                });
+                Some(Box::pin(async move { handler_clone(old, new).await })
+                    as Pin<Box<dyn Future<Output = ()> + Send>>)
+            } else {
+                None
             }
         });
 
-        self.subscribe(observer)
+        self.subscribe_async_callback(observer)
     }
 
     /// Create a new ObservableProperty with transformation applied to the value
     ///
     /// This creates a derived property that tracks changes to the original property,
-    /// but with a transformation applied. Changes to the original property are reflected
-    /// in the derived property, but the derived property is read-only.
+    /// with a transformation applied. The result is an ordinary property and can also
+    /// be changed directly. The source observer is removed when the final clone of the
+    /// derived property is dropped.
     ///
     /// # Arguments
     ///
@@ -903,7 +966,6 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// ```rust
     /// use observable_property_tokio::ObservableProperty;
-    /// use std::sync::Arc;
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
@@ -930,13 +992,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let initial_value = transform(&self.get()?);
         let derived = ObservableProperty::new(initial_value);
 
-        let derived_clone = derived.clone();
-        self.subscribe(Arc::new(move |_, new_value| {
-            let transformed = transform(new_value);
-            if let Err(e) = derived_clone.set(transformed) {
-                eprintln!("Failed to update derived property: {}", e);
+        let derived_inner = Arc::downgrade(&derived.inner);
+        let id = self.subscribe(Arc::new(move |_, new_value| {
+            if let Some(inner) = derived_inner.upgrade() {
+                let transformed = transform(new_value);
+                let (old_value, new_value, observers) = replace_value(&inner, |_| transformed);
+                notify_sync(old_value, new_value, observers);
             }
         }))?;
+        derived.keepalive.lock().push(Box::new(Subscription {
+            inner: Arc::clone(&self.inner),
+            id,
+        }));
 
         Ok(derived)
     }
@@ -995,9 +1062,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// production environments where you need to ensure proper resource cleanup
     /// during application shutdown or when disposing of property instances.
     ///
-    /// Currently, this method performs the same operation as `clear_observers()`,
-    /// but it's provided as a separate method to allow for future expansion
-    /// of cleanup operations (such as canceling pending async tasks).
+    /// This performs the same operation as `clear_observers()`. Async observer work
+    /// that has already started is not cancelled.
     ///
     /// # Returns
     ///
@@ -1031,15 +1097,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub fn shutdown(&self) -> Result<(), PropertyError> {
-        // Cancel any pending async observers
         self.clear_observers()
     }
 
-    pub fn subscribe_with_token(&self, observer: Observer<T>) -> Result<Subscription<T>, PropertyError> {
+    pub fn subscribe_with_token(
+        &self,
+        observer: Observer<T>,
+    ) -> Result<Subscription<T>, PropertyError> {
         let id = self.subscribe(observer)?;
         Ok(Subscription {
             inner: Arc::clone(&self.inner),
-            id
+            id,
         })
     }
 
@@ -1054,11 +1122,14 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let id = self.subscribe_filtered(observer, filter)?;
         Ok(Subscription {
             inner: Arc::clone(&self.inner),
-            id
+            id,
         })
     }
 
-    pub fn subscribe_async_with_token<F, Fut>(&self, handler: F) -> Result<Subscription<T>, PropertyError>
+    pub fn subscribe_async_with_token<F, Fut>(
+        &self,
+        handler: F,
+    ) -> Result<Subscription<T>, PropertyError>
     where
         F: Fn(T, T) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1066,7 +1137,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let id = self.subscribe_async(handler)?;
         Ok(Subscription {
             inner: Arc::clone(&self.inner),
-            id
+            id,
         })
     }
 
@@ -1083,10 +1154,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let id = self.subscribe_async_filtered(handler, filter)?;
         Ok(Subscription {
             inner: Arc::clone(&self.inner),
-            id
+            id,
         })
     }
-
 }
 
 impl<T: Clone + Send + Sync + 'static + Default> Default for ObservableProperty<T> {
@@ -1136,6 +1206,7 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            keepalive: Arc::clone(&self.keepalive),
         }
     }
 }
@@ -1148,15 +1219,23 @@ impl<T: Clone + Send + Sync + 'static> Clone for PropertyHandle<T> {
     }
 }
 
+impl From<JoinError> for PropertyError {
+    fn from(err: JoinError) -> Self {
+        PropertyError::JoinError(err.to_string())
+    }
+}
+
 impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for ObservableProperty<T> {
     /// Debug implementation that shows the current value if accessible
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.get() {
-            Ok(value) => f.debug_struct("ObservableProperty")
+            Ok(value) => f
+                .debug_struct("ObservableProperty")
                 .field("value", &value)
                 .field("observers_count", &self.observer_count())
                 .finish(),
-            Err(_) => f.debug_struct("ObservableProperty")
+            Err(_) => f
+                .debug_struct("ObservableProperty")
                 .field("value", &"[inaccessible]")
                 .field("observers_count", &self.observer_count())
                 .finish(),
@@ -1208,6 +1287,28 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_updates_are_atomic() -> Result<(), PropertyError> {
+        let property = Arc::new(ObservableProperty::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let property = Arc::clone(&property);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                for _ in 0..250 {
+                    property.update(|value| value + 1).unwrap();
+                }
+            }));
+        }
+
+        for task in tasks {
+            task.await.map_err(PropertyError::from)?;
+        }
+
+        assert_eq!(property.get()?, 2_000);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_update_async() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(10);
@@ -1225,6 +1326,20 @@ mod tests {
 
         property.set(20)?;
         assert_eq!(derived.get()?, "20");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_map_unsubscribes_when_last_derived_clone_drops() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(10);
+        let derived = property.map(|value| value * 2)?;
+        let derived_clone = derived.clone();
+        assert_eq!(property.observer_count(), 1);
+
+        drop(derived);
+        assert_eq!(property.observer_count(), 1);
+        drop(derived_clone);
+        assert_eq!(property.observer_count(), 0);
         Ok(())
     }
 
@@ -1325,6 +1440,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_async_waits_for_async_observers() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let observer_counter = Arc::clone(&counter);
+
+        property.subscribe_async(move |_, _| {
+            let counter = Arc::clone(&observer_counter);
+            async move {
+                sleep(Duration::from_millis(10)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })?;
+
+        property.set_async(1).await?;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_async_reports_async_observer_panics() -> Result<(), PropertyError> {
+        let property = ObservableProperty::new(0);
+        property.subscribe_async(|_, _| async {
+            panic!("async observer panic");
+        })?;
+
+        assert!(matches!(
+            property.set_async(1).await,
+            Err(PropertyError::JoinError(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_subscribe_async_filtered() -> Result<(), PropertyError> {
         let property = ObservableProperty::new(0);
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1338,11 +1486,11 @@ mod tests {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
             },
-            |old, new| new > old
+            |old, new| new > old,
         )?;
 
         property.set_async(10).await?; // Should trigger (0 -> 10)
-        property.set_async(5).await?;  // Should NOT trigger (10 -> 5)
+        property.set_async(5).await?; // Should NOT trigger (10 -> 5)
         property.set_async(15).await?; // Should trigger (5 -> 15)
 
         // Give time for async operations to complete
@@ -1361,12 +1509,16 @@ mod tests {
 
         property.subscribe(Arc::new({
             let counter = counter1.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         property.subscribe(Arc::new({
             let counter = counter2.clone();
-            move |_, _| { counter.fetch_add(2, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(2, Ordering::SeqCst);
+            }
         }))?;
 
         property.set(42)?;
@@ -1383,7 +1535,9 @@ mod tests {
 
         let id = property.subscribe(Arc::new({
             let counter = counter.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         property.set(1)?;
@@ -1398,7 +1552,7 @@ mod tests {
 
         // Try to unsubscribe again, should fail with ObserverNotFound
         match property.unsubscribe(id) {
-            Err(PropertyError::ObserverNotFound { .. }) => {},
+            Err(PropertyError::ObserverNotFound { .. }) => {}
             other => panic!("Expected ObserverNotFound error, got {:?}", other),
         }
 
@@ -1414,13 +1568,15 @@ mod tests {
         property.subscribe_filtered(
             Arc::new({
                 let counter = counter.clone();
-                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                move |_, _| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
             }),
-            |old, new| new > old // Only trigger when value increases
+            |old, new| new > old, // Only trigger when value increases
         )?;
 
         property.set(10)?; // Should trigger (0 -> 10)
-        property.set(5)?;  // Should NOT trigger (10 -> 5)
+        property.set(5)?; // Should NOT trigger (10 -> 5)
         property.set(15)?; // Should trigger (5 -> 15)
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -1429,7 +1585,8 @@ mod tests {
 
     // Concurrent access tests
     #[tokio::test]
-    async fn test_concurrent_modifications() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_concurrent_modifications() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    {
         let property = Arc::new(ObservableProperty::new(0));
         let final_counter = Arc::new(AtomicUsize::new(0));
 
@@ -1447,7 +1604,8 @@ mod tests {
         for i in 1..=5 {
             let prop = property.clone();
             let task = tokio::spawn(async move {
-                prop.set(i).map_err(|e| format!("Failed to set property: {}", e))
+                prop.set(i)
+                    .map_err(|e| format!("Failed to set property: {}", e))
             });
             tasks.push(task);
         }
@@ -1459,7 +1617,7 @@ mod tests {
 
         // Final value should be one of the set values (1-5)
         let final_value = final_counter.load(Ordering::SeqCst);
-        assert!(final_value >= 1 && final_value <= 5);
+        assert!((1..=5).contains(&final_value));
         Ok(())
     }
 
@@ -1477,7 +1635,9 @@ mod tests {
         // Second observer should still run
         property.subscribe(Arc::new({
             let counter = counter.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         // This should not panic the test
@@ -1497,7 +1657,9 @@ mod tests {
         // Register two types of observers - one sync, one async
         property.subscribe(Arc::new({
             let counter = counter.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         let counter_clone = counter.clone();
@@ -1595,9 +1757,11 @@ mod tests {
         property.subscribe_filtered(
             Arc::new({
                 let counter = name_changes.clone();
-                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                move |_, _| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
             }),
-            |old, new| old.name != new.name // Only notify on name changes
+            |old, new| old.name != new.name, // Only notify on name changes
         )?;
 
         // Update age only - shouldn't trigger
@@ -1648,7 +1812,9 @@ mod tests {
             // Create a subscription in this scope
             let _subscription = property.subscribe_with_token(Arc::new({
                 let counter = counter.clone();
-                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                move |_, _| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
             }))?;
 
             // Update should trigger the observer
@@ -1680,9 +1846,11 @@ mod tests {
             let _subscription = property.subscribe_filtered_with_token(
                 Arc::new({
                     let counter = counter.clone();
-                    move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                    move |_, _| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
                 }),
-                filter
+                filter,
             )?;
 
             property.set(10)?; // Should trigger (0 -> 10)
@@ -1751,7 +1919,7 @@ mod tests {
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
                 },
-                |old, new| new > old // Only trigger when value increases
+                |old, new| new > old, // Only trigger when value increases
             )?;
 
             property.set_async(10).await?; // Should trigger (0 -> 10)
@@ -1784,13 +1952,17 @@ mod tests {
         // First subscription
         let subscription1 = property.subscribe_with_token(Arc::new({
             let counter = counter1.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         // Second subscription
         let subscription2 = property.subscribe_with_token(Arc::new({
             let counter = counter2.clone();
-            move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+            move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
         }))?;
 
         // Both subscriptions should receive updates
@@ -1829,7 +2001,9 @@ mod tests {
             // Create subscription
             subscription = property.subscribe_with_token(Arc::new({
                 let counter = counter.clone();
-                move |_, _| { counter.fetch_add(1, Ordering::SeqCst); }
+                move |_, _| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
             }))?;
 
             // Subscription works normally
@@ -1891,37 +2065,5 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         Ok(())
-    }
-}
-
-impl From<JoinError> for PropertyError {
-    /// Convert a Tokio JoinError into a PropertyError
-    ///
-    /// This enables using the `?` operator directly on `task::spawn(...).await`
-    /// which returns a `Result<T, JoinError>`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use observable_property_tokio::ObservableProperty;
-    /// use std::sync::Arc;
-    /// use tokio::task;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), observable_property_tokio::PropertyError> {
-    ///     let property = Arc::new(ObservableProperty::new(0));
-    ///     let property_clone = property.clone();
-    ///
-    ///     // This task::spawn can now use ?? to propagate both types of errors
-    ///     task::spawn(async move {
-    ///         property_clone.set(42)?;
-    ///         Ok::<_, observable_property_tokio::PropertyError>(())
-    ///     }).await??;
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
-    fn from(err: JoinError) -> Self {
-        PropertyError::JoinError(err.to_string())
     }
 }
