@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-10
+
+### Changed
+- `set_async()` and `update_async()` now await async observers and report observer task panics.
+- Property updates enqueue notification snapshots in commit order and dispatch them FIFO.
+- Async observer batches for separate updates now run in FIFO order; observers within one update still run concurrently.
+- `update()` and `update_async()` now apply their update closures atomically while holding the property write lock. Update closures must not re-enter the same property.
+- Async observers triggered by synchronous setters run as detached Tokio tasks and require an active Tokio runtime.
+- Corrected package licensing metadata to declare `MIT OR Apache-2.0`.
+
+### Fixed
+- Prevented concurrent updates from overwriting one another.
+- Prevented mapped properties from becoming stale when concurrent notifications arrive.
+- Unregister the source observer when the last clone of a mapped property is dropped.
+
+### Added
+- Regression tests for concurrent updates, FIFO notification delivery, async observer completion and panics, and mapped-property cleanup.
+- CI checks for the declared Rust 1.89 MSRV and stable, formatting, Clippy, documentation, doctests, and package contents.
+
 ## [0.2.0] - 2025-09-29
 
 ### Added
