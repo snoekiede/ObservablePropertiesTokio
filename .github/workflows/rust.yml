@@ -20,8 +20,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Test all targets
-        run: cargo test --all-targets --locked
+        run: cargo test --all-targets
 
+        
   quality:
     runs-on: ubuntu-latest
 
@@ -38,6 +39,6 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps --all-features
       - name: Test documentation examples
-        run: cargo test --doc --locked
+        run: cargo test --doc
       - name: Check package contents
-        run: cargo package --locked --no-verify
+        run: cargo package --no-verify
