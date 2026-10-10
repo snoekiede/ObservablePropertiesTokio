@@ -13,10 +13,11 @@ A thread-safe, async-compatible observable property implementation for Rust that
 
 - Test the crate with your workload before adopting it in production; this project does not provide a production-readiness guarantee.
 - `set()` dispatches async observers as detached Tokio tasks. Use `set_async()` or `update_async()` when the caller must wait for async observer completion or receive task join errors.
-- `set_async()` and `update_async()` run async observers concurrently and wait for all of them. Synchronous observers run on the caller's task.
+- Notifications are enqueued in value-commit order and dispatched FIFO, so mapped values cannot be overwritten by an older notification. If another caller is already dispatching, a synchronous `set()` or `update()` queues its notification and can return before observers receive it.
+- `set_async()` and `update_async()` run async observers for one update concurrently, while async observer batches from separate updates run in FIFO order. The async methods wait for their update's async observers. Synchronous observers run on the dispatcher task.
 - `update()` and `update_async()` run the update closure under the property's write lock to make updates atomic. Do not call back into the same property from that closure.
-- `clear_observers()` and `shutdown()` remove registered observers but do not cancel async observer work that has already started.
-- Each async observer runs in its own Tokio task; high update rates or large observer counts can add task scheduling and cloning overhead.
+- `clear_observers()` and `shutdown()` remove registered observers but do not cancel async observer work that has already been queued or started.
+- Each async observer runs in its own Tokio task; high update rates or large observer counts can add task scheduling and cloning overhead. Synchronous setters need to be called in a Tokio runtime to dispatch async observers.
 - The `map()` observer is retained only while at least one clone of the derived property remains alive.
 
 **Performance characteristics may vary** depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.

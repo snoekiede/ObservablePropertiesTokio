@@ -69,7 +69,7 @@
 //! ```
 
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::panic;
@@ -127,8 +127,14 @@ pub enum PropertyError {
 
 /// Function type for observers that get called when property values change
 pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
-type AsyncObserver<T> =
-    Arc<dyn Fn(T, T) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> + Send + Sync>;
+type AsyncObserver<T> = Arc<dyn Fn(T, T) -> Option<AsyncFuture> + Send + Sync>;
+type AsyncFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct AsyncNotification {
+    futures: Vec<AsyncFuture>,
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    error: Option<String>,
+}
 
 #[derive(Clone)]
 enum ObserverCallback<T> {
@@ -231,12 +237,25 @@ struct InnerProperty<T> {
     value: T,
     observers: HashMap<ObserverId, ObserverCallback<T>>,
     next_id: usize,
+    pending_notifications: VecDeque<Notification<T>>,
+    notifying: bool,
+    async_sender: Option<tokio::sync::mpsc::UnboundedSender<AsyncNotification>>,
+}
+
+struct Notification<T> {
+    old_value: T,
+    new_value: T,
+    observers: Vec<ObserverCallback<T>>,
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 fn replace_value<T, F>(
     inner: &Arc<RwLock<InnerProperty<T>>>,
     update_fn: F,
-) -> (T, T, Vec<ObserverCallback<T>>)
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    runtime: Option<tokio::runtime::Handle>,
+) -> bool
 where
     T: Clone,
     F: FnOnce(T) -> T,
@@ -246,39 +265,53 @@ where
     let new_value = update_fn(current_value);
     let old_value = std::mem::replace(&mut inner.value, new_value.clone());
     let observers = inner.observers.values().cloned().collect();
-    (old_value, new_value, observers)
-}
+    inner.pending_notifications.push_back(Notification {
+        old_value,
+        new_value,
+        observers,
+        completion,
+        runtime,
+    });
 
-fn notify_sync<T: Clone>(old_value: T, new_value: T, observers: Vec<ObserverCallback<T>>) {
-    for observer in observers {
-        match observer {
-            ObserverCallback::Sync(observer) => {
-                if let Err(error) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    observer(&old_value, &new_value);
-                })) {
-                    eprintln!("Observer panic: {error:?}");
-                }
-            }
-            ObserverCallback::Async(observer) => {
-                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    if let Some(future) = observer(old_value.clone(), new_value.clone()) {
-                        tokio::spawn(future);
-                    }
-                }));
-                if let Err(error) = result {
-                    eprintln!("Failed to spawn async observer: {error:?}");
-                }
-            }
-        }
+    if inner.notifying {
+        false
+    } else {
+        inner.notifying = true;
+        true
     }
 }
 
-async fn notify_async<T: Clone>(
-    old_value: T,
-    new_value: T,
-    observers: Vec<ObserverCallback<T>>,
-) -> Result<(), PropertyError> {
-    let mut tasks = JoinSet::new();
+fn dispatch_pending<T: Clone>(inner: &Arc<RwLock<InnerProperty<T>>>) {
+    loop {
+        let notification = {
+            let mut inner = inner.write();
+            match inner.pending_notifications.pop_front() {
+                Some(notification) => notification,
+                None => {
+                    inner.notifying = false;
+                    return;
+                }
+            }
+        };
+
+        dispatch_notification(notification, inner);
+    }
+}
+
+fn dispatch_notification<T: Clone>(
+    notification: Notification<T>,
+    inner: &Arc<RwLock<InnerProperty<T>>>,
+) {
+    let Notification {
+        old_value,
+        new_value,
+        observers,
+        completion,
+        runtime,
+    } = notification;
+    let mut async_futures = Vec::new();
+    let mut async_error = None;
+
     for observer in observers {
         match observer {
             ObserverCallback::Sync(observer) => {
@@ -292,24 +325,95 @@ async fn notify_async<T: Clone>(
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     observer(old_value.clone(), new_value.clone())
                 })) {
-                    Ok(Some(future)) => {
-                        tasks.spawn(future);
-                    }
+                    Ok(Some(future)) => async_futures.push(future),
                     Ok(None) => {}
-                    Err(error) => eprintln!("Async observer panic: {error:?}"),
+                    Err(_) => {
+                        async_error.get_or_insert_with(|| {
+                            "Async observer panicked before returning its future".to_string()
+                        });
+                    }
                 }
             }
         }
     }
 
-    let mut first_join_error = None;
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result {
-            first_join_error.get_or_insert(error);
+    if async_futures.is_empty() && async_error.is_none() {
+        if let Some(completion) = completion {
+            let _ = completion.send(Ok(()));
         }
+        return;
     }
 
-    first_join_error.map_or(Ok(()), |error| Err(PropertyError::from(error)))
+    let Some(runtime) = runtime else {
+        if let Some(completion) = completion {
+            let _ = completion.send(Err(
+                "No Tokio runtime was available to execute async observers".to_string(),
+            ));
+        } else {
+            eprintln!("Cannot run async observer without an active Tokio runtime");
+        }
+        return;
+    };
+
+    let (sender, receiver) = {
+        let mut inner = inner.write();
+        match inner.async_sender.as_ref() {
+            Some(sender) if !sender.is_closed() => (sender.clone(), None),
+            _ => {
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                inner.async_sender = Some(sender.clone());
+                (sender, Some(receiver))
+            }
+        }
+    };
+
+    if let Some(receiver) = receiver {
+        runtime.spawn(run_async_notifications(receiver));
+    }
+    if sender
+        .send(AsyncNotification {
+            futures: async_futures,
+            completion,
+            error: async_error,
+        })
+        .is_err()
+    {
+        eprintln!("Async observer worker stopped before accepting a notification");
+    }
+}
+
+async fn run_async_notifications(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<AsyncNotification>,
+) {
+    while let Some(notification) = receiver.recv().await {
+        let mut tasks = JoinSet::new();
+        for future in notification.futures {
+            tasks.spawn(future);
+        }
+
+        let mut first_error = notification.error;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+
+        let result = first_error.map_or(Ok(()), Err);
+        if let Some(completion) = notification.completion {
+            let _ = completion.send(result);
+        } else if let Err(error) = result {
+            eprintln!("Detached async observer failed: {error}");
+        }
+    }
+}
+
+async fn await_async_observers(
+    receiver: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) -> Result<(), PropertyError> {
+    receiver
+        .await
+        .map_err(|error| PropertyError::JoinError(error.to_string()))?
+        .map_err(PropertyError::JoinError)
 }
 
 pub struct PropertyHandle<T: Clone + Send + Sync + 'static> {
@@ -367,6 +471,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 value: initial_value,
                 observers: HashMap::new(),
                 next_id: 0,
+                pending_notifications: VecDeque::new(),
+                notifying: false,
+                async_sender: None,
             })),
             keepalive: Arc::new(Mutex::new(Vec::new())),
         }
@@ -419,13 +526,14 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// This method will:
     /// 1. Acquire a write lock (blocking other readers/writers)
-    /// 2. Update the value and capture a snapshot of observers
+    /// 2. Update the value and enqueue a snapshot of observers in commit order
     /// 3. Release the lock
-    /// 4. Notify synchronous observers sequentially and launch async observers
-    ///    as detached Tokio tasks
+    /// 4. Dispatch notifications sequentially in FIFO order
     ///
-    /// Observer notifications are wrapped in panic recovery to prevent one
-    /// misbehaving observer from affecting others.
+    /// Notifications are wrapped in panic recovery to prevent one misbehaving
+    /// synchronous observer from affecting others. If another caller is already
+    /// dispatching notifications, this call enqueues its notification and may
+    /// return before that notification is delivered.
     ///
     /// # Arguments
     ///
@@ -455,17 +563,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, new_value, observers) = replace_value(&self.inner, |_| new_value);
-        notify_sync(old_value, new_value, observers);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if replace_value(&self.inner, |_| new_value, None, runtime) {
+            dispatch_pending(&self.inner);
+        }
         Ok(())
     }
 
     /// Sets the property and awaits all registered async observers.
     ///
-    /// Async observers run concurrently. Synchronous observers run on the calling
-    /// task before this method waits for async observers. If an async observer task
-    /// panics, all started observers are still awaited and the first join error is
-    /// returned.
+    /// Notifications are dispatched in FIFO commit order. Synchronous observers
+    /// run on the current dispatcher. Async observers for one update run concurrently;
+    /// separate update batches run in FIFO order and are awaited before this method
+    /// returns. If another caller is dispatching, this method waits until its
+    /// notification reaches the head of the queue.
     ///
     /// # Arguments
     ///
@@ -497,8 +608,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// }
     /// ```
     pub async fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, new_value, observers) = replace_value(&self.inner, |_| new_value);
-        notify_async(old_value, new_value, observers).await
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|error| PropertyError::TokioError {
+                reason: error.to_string(),
+            })?;
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        if replace_value(&self.inner, |_| new_value, Some(completion), Some(runtime)) {
+            dispatch_pending(&self.inner);
+        }
+        await_async_observers(receiver).await
     }
 
     /// Update the property value using a closure that has access to the current value
@@ -538,8 +656,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     {
         // The update closure runs under the write lock so concurrent updates cannot
         // overwrite one another. It must not re-enter this property.
-        let (old_value, new_value, observers) = replace_value(&self.inner, update_fn);
-        notify_sync(old_value, new_value, observers);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if replace_value(&self.inner, update_fn, None, runtime) {
+            dispatch_pending(&self.inner);
+        }
         Ok(())
     }
 
@@ -575,9 +695,16 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(T) -> T,
     {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|error| PropertyError::TokioError {
+                reason: error.to_string(),
+            })?;
         // Compute and publish atomically before awaiting observer work.
-        let (old_value, new_value, observers) = replace_value(&self.inner, update_fn);
-        notify_async(old_value, new_value, observers).await
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        if replace_value(&self.inner, update_fn, Some(completion), Some(runtime)) {
+            dispatch_pending(&self.inner);
+        }
+        await_async_observers(receiver).await
     }
 
     /// Subscribes an observer function to be called when the property changes
@@ -996,8 +1123,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let id = self.subscribe(Arc::new(move |_, new_value| {
             if let Some(inner) = derived_inner.upgrade() {
                 let transformed = transform(new_value);
-                let (old_value, new_value, observers) = replace_value(&inner, |_| transformed);
-                notify_sync(old_value, new_value, observers);
+                let runtime = tokio::runtime::Handle::try_current().ok();
+                if replace_value(&inner, |_| transformed, None, runtime) {
+                    dispatch_pending(&inner);
+                }
             }
         }))?;
         derived.keepalive.lock().push(Box::new(Subscription {
@@ -1063,7 +1192,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// during application shutdown or when disposing of property instances.
     ///
     /// This performs the same operation as `clear_observers()`. Async observer work
-    /// that has already started is not cancelled.
+    /// that has already been queued or started is not cancelled.
     ///
     /// # Returns
     ///
@@ -1455,6 +1584,105 @@ mod tests {
 
         property.set_async(1).await?;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_observer_batches_run_in_update_order() -> Result<(), PropertyError> {
+        let property = Arc::new(ObservableProperty::new(0));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        let started = Arc::clone(&first_started);
+        let release = Arc::clone(&release_first);
+        let observed_clone = Arc::clone(&observed);
+        property.subscribe_async(move |_, new_value| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let observed = Arc::clone(&observed_clone);
+            async move {
+                if new_value == 1 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                observed.lock().push(new_value);
+            }
+        })?;
+
+        let first_property = Arc::clone(&property);
+        let first = tokio::spawn(async move { first_property.set_async(1).await });
+        first_started.notified().await;
+
+        let second_property = Arc::clone(&property);
+        let second = tokio::spawn(async move { second_property.set_async(2).await });
+        while property.get()? != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(observed.lock().is_empty());
+        release_first.notify_one();
+        first.await.map_err(PropertyError::from)??;
+        second.await.map_err(PropertyError::from)??;
+
+        assert_eq!(*observed.lock(), vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_notifications_are_dispatched_in_commit_order() -> Result<(), PropertyError> {
+        let property = Arc::new(ObservableProperty::new(0));
+        let callback_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_callback = Arc::new(std::sync::Barrier::new(2));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+
+        let callback_property = Arc::clone(&property);
+        let callback_entered_clone = Arc::clone(&callback_entered);
+        let release_callback_clone = Arc::clone(&release_callback);
+        let observed_clone = Arc::clone(&observed);
+        property.subscribe(Arc::new(move |_, new_value| {
+            if *new_value == 1 {
+                callback_entered_clone.wait();
+                release_callback_clone.wait();
+            }
+            observed_clone.lock().push(*new_value);
+        }))?;
+
+        let first_update = std::thread::spawn(move || callback_property.set(1));
+        callback_entered.wait();
+        property.set(2)?;
+        release_callback.wait();
+        first_update.join().expect("first update thread panicked")?;
+
+        assert_eq!(*observed.lock(), vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mapped_property_stays_in_sync_with_concurrent_updates() -> Result<(), PropertyError> {
+        let property = Arc::new(ObservableProperty::new(0));
+        let transform_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_transform = Arc::new(std::sync::Barrier::new(2));
+
+        let entered_clone = Arc::clone(&transform_entered);
+        let release_clone = Arc::clone(&release_transform);
+        let mapped = property.map(move |value| {
+            if *value == 1 {
+                entered_clone.wait();
+                release_clone.wait();
+            }
+            *value
+        })?;
+
+        let update_property = Arc::clone(&property);
+        let first_update = std::thread::spawn(move || update_property.set(1));
+        transform_entered.wait();
+        property.set(2)?;
+        release_transform.wait();
+        first_update.join().expect("first update thread panicked")?;
+
+        assert_eq!(property.get()?, 2);
+        assert_eq!(mapped.get()?, 2);
         Ok(())
     }
 
